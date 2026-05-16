@@ -66,13 +66,52 @@ const getAiConfig = (): AiConfig => {
   }
 };
 
-// Resolves the model to use. If the caller passed a recognizable Gemini model name
-// (legacy), we ignore it and fall through to the configured local model. Otherwise
-// the caller's choice wins (lets future code pick e.g. a smaller model for grading).
-const resolveModel = (requested?: string): string => {
+// --- Auto-detect default model from /v1/models ----------------------------
+// When the user hasn't picked a model in Settings (config.model === DEFAULT_MODEL),
+// query the OpenAI-compatible /v1/models endpoint and use the first available id.
+// LM Studio rejects requests for unknown model ids on /v1/chat/completions, so this
+// removes the "first call 404s" friction. Cached per-baseUrl for the session.
+const modelCache = new Map<string, string>();   // baseUrl -> resolved model id
+let modelProbeInflight: Map<string, Promise<string>> = new Map();
+
+const deriveModelsUrl = (chatCompletionsUrl: string): string => {
+  // chatCompletionsUrl ends with /v1/chat/completions; swap to /v1/models
+  return chatCompletionsUrl.replace(/\/chat\/completions\/?$/i, '/models');
+};
+
+const probeAvailableModel = async (cfg: AiConfig): Promise<string> => {
+  const cached = modelCache.get(cfg.baseUrl);
+  if (cached) return cached;
+  const pending = modelProbeInflight.get(cfg.baseUrl);
+  if (pending) return pending;
+  const p = (async (): Promise<string> => {
+    const url = deriveModelsUrl(cfg.baseUrl);
+    const headers: Record<string, string> = {};
+    if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
+    try {
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) return DEFAULT_MODEL;
+      const data = await resp.json();
+      const first = data?.data?.[0]?.id;
+      if (typeof first === 'string' && first) {
+        modelCache.set(cfg.baseUrl, first);
+        return first;
+      }
+    } catch { /* fall through */ }
+    return DEFAULT_MODEL;
+  })();
+  modelProbeInflight.set(cfg.baseUrl, p);
+  try { return await p; } finally { modelProbeInflight.delete(cfg.baseUrl); }
+};
+
+// Resolves the model to use. Order: explicit non-Gemini caller param wins, then
+// configured aiModel (if not the default placeholder), then auto-detected from
+// /v1/models, then the placeholder string as a last resort.
+const resolveModel = async (requested?: string): Promise<string> => {
+  if (requested && !/^gemini[-/]/i.test(requested)) return requested;
   const cfg = getAiConfig();
-  if (!requested || /^gemini[-/]/i.test(requested)) return cfg.model;
-  return requested;
+  if (cfg.model && cfg.model !== DEFAULT_MODEL) return cfg.model;
+  return probeAvailableModel(cfg);
 };
 
 // --- HTTP layer ------------------------------------------------------------
@@ -114,7 +153,7 @@ class AiServiceError extends Error {
 
 const callChatCompletion = async (opts: ChatRequestOptions): Promise<{ text: string; usage: TokenUsage; finishReason?: string }> => {
   const cfg = getAiConfig();
-  const modelToUse = opts.model || cfg.model;
+  const modelToUse = await resolveModel(opts.model);
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
@@ -167,6 +206,102 @@ const callChatCompletion = async (opts: ChatRequestOptions): Promise<{ text: str
       model: data.model || modelToUse,
     };
     return { text, usage, finishReason: data.choices?.[0]?.finish_reason };
+  } finally {
+    inflightControllers.delete(controller);
+    emitInflightChange();
+  }
+};
+
+// --- Streaming variant -----------------------------------------------------
+// Same registration/cancellation behavior as callChatCompletion, but consumes
+// SSE chunks from `stream: true`. onToken fires for each incremental delta.
+// Returns the final accumulated text and usage (when the server emits a final
+// chunk with `usage`; otherwise zeros).
+export const callChatCompletionStream = async (
+  opts: ChatRequestOptions,
+  onToken: (delta: string) => void,
+): Promise<{ text: string; usage: TokenUsage; finishReason?: string }> => {
+  const cfg = getAiConfig();
+  const modelToUse = await resolveModel(opts.model);
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
+
+  const body: Record<string, unknown> = {
+    model: modelToUse,
+    messages: opts.messages,
+    temperature: opts.temperature ?? 0.7,
+    stream: true,
+  };
+  if (opts.topP !== undefined) body.top_p = opts.topP;
+  if (opts.maxTokens !== undefined) body.max_tokens = opts.maxTokens;
+
+  const controller = new AbortController();
+  inflightControllers.add(controller);
+  emitInflightChange();
+  try {
+    let response: Response;
+    try {
+      response = await fetch(cfg.baseUrl, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal });
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        throw new AiServiceError('Generation cancelled by user.');
+      }
+      throw new AiServiceError(`Network error contacting AI endpoint at ${cfg.baseUrl}: ${err?.message ?? err}`);
+    }
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      throw new AiServiceError(`AI server responded ${response.status}: ${errText || response.statusText}`, response.status);
+    }
+    if (!response.body) throw new AiServiceError('AI server returned no body for streaming request.');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullText = '';
+    let buffer = '';
+    let usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, model: modelToUse };
+    let finishReason: string | undefined;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE frames are separated by \n\n; each frame may contain multiple `data:` lines.
+      let sepIdx: number;
+      while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sepIdx);
+        buffer = buffer.slice(sepIdx + 2);
+        for (const rawLine of frame.split('\n')) {
+          const line = rawLine.trim();
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(payload);
+            const delta = parsed?.choices?.[0]?.delta?.content;
+            if (typeof delta === 'string' && delta.length > 0) {
+              fullText += delta;
+              onToken(delta);
+            }
+            const fr = parsed?.choices?.[0]?.finish_reason;
+            if (fr) finishReason = fr;
+            if (parsed?.usage) {
+              usage = {
+                prompt_tokens: parsed.usage.prompt_tokens ?? 0,
+                completion_tokens: parsed.usage.completion_tokens ?? 0,
+                total_tokens: parsed.usage.total_tokens ?? 0,
+                model: parsed.model || modelToUse,
+              };
+            }
+          } catch {
+            // Tolerate occasional malformed frames — some servers send keep-alive comments.
+          }
+        }
+      }
+    }
+
+    return { text: fullText, usage, finishReason };
   } finally {
     inflightControllers.delete(controller);
     emitInflightChange();
@@ -265,7 +400,7 @@ export const performShunt = async (
       const prompt = getPromptForAction(text, action, context, priority, promptInjectionGuardEnabled);
       const { text: resultText, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(modelName),
+        model: modelName,
       });
       if (
         action === ShuntAction.FORMAT_JSON ||
@@ -295,7 +430,7 @@ export const executeModularPrompt = async (
     const apiCall = async () => {
       const { text: resultText, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return { resultText, tokenUsage: usage };
     };
@@ -321,7 +456,7 @@ ${output}
     const apiCall = async () => {
       const { text } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
         temperature: 0.0,
       });
       const m = text.match(/Score:\s*(-?\d+)/);
@@ -349,7 +484,7 @@ ${combinedContent}
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(modelName),
+        model: modelName,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -362,13 +497,13 @@ ${combinedContent}
 
 export const generateRawText = async (
   prompt: string | ContentPart[],
-  modelName: string,
+  modelName?: string,
 ): Promise<{ resultText: string; tokenUsage: TokenUsage }> => {
   try {
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [buildUserMessage(prompt)],
-        model: resolveModel(modelName),
+        model: modelName,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -406,7 +541,7 @@ ${MIA_RESEARCH_LOG}
           { role: 'system', content: systemInstruction },
           { role: 'user', content: userDraft },
         ],
-        model: resolveModel(),
+        model: undefined,
         temperature: 0.3,
       });
       return text.trim();
@@ -437,7 +572,7 @@ ${eventsJson}
     const apiCall = async () => {
       const { text } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return text;
     };
@@ -453,7 +588,7 @@ export const generateOrchestratorReport = async (prompt: string): Promise<{ resu
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -482,7 +617,7 @@ ${metrics}
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -507,7 +642,7 @@ Respond ONLY with a JSON object of the shape {"answer": string, "isContextRelate
   try {
     const apiCall = async () => {
       const { data, usage } = await generateJson(null, wrappedPrompt, aiContextChatSchema, {
-        model: resolveModel(),
+        model: undefined,
       });
       return {
         answer: data.answer || "Sorry, I couldn't generate a proper response.",
@@ -557,7 +692,7 @@ Respond ONLY with a JSON object of this exact shape:
   try {
     const apiCall = async () => {
       const { data, usage } = await generateJson(null, prompt, aiPlanResponseSchema, {
-        model: resolveModel(),
+        model: undefined,
         temperature: 0.1,
         topP: 0.9,
         maxTokens: 4096,
@@ -630,7 +765,7 @@ ${projectContext}
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -677,7 +812,7 @@ Then, if the image contains a character, creature, or object suitable for a 3D m
       };
       const { text, usage } = await callChatCompletion({
         messages: [message],
-        model: resolveModel(),
+        model: undefined,
       });
       return { resultText: text, tokenUsage: usage };
     };
@@ -711,7 +846,7 @@ export class AiChat {
     if (this.systemInstruction) messages.push({ role: 'system', content: this.systemInstruction });
     messages.push(...this.history);
     messages.push({ role: 'user', content: input.message });
-    const { text } = await callChatCompletion({ messages, model: resolveModel() });
+    const { text } = await callChatCompletion({ messages, model: undefined });
     this.history.push({ role: 'user', content: input.message });
     this.history.push({ role: 'assistant', content: text });
     return { text };
@@ -743,7 +878,7 @@ ${projectContext}
 ---
 `;
   try {
-    return await generateRawText(prompt, resolveModel());
+    return await generateRawText(prompt, undefined);
   } catch (error) {
     logFrontendError(error, ErrorSeverity.High, { context: 'generateApiDocumentation AI call' });
     throw error;
@@ -775,7 +910,7 @@ ${projectContext}
 ---
 `;
   try {
-    return await generateRawText(prompt, resolveModel());
+    return await generateRawText(prompt, undefined);
   } catch (error) {
     logFrontendError(error, ErrorSeverity.High, { context: 'generateQualityReport AI call' });
     throw error;
@@ -784,23 +919,48 @@ ${projectContext}
 
 // --- Mia helpers (formerly in miaService.ts) -------------------------------
 
+const MIA_SYSTEM_INSTRUCTION =
+  'You are Mia, a friendly and highly intelligent AI assistant embedded in a complex web application for developers. Be helpful and concise. Your primary role is to assist the user with understanding and operating the application.';
+
 export const getMiaChatResponse = async (
   history: AiChatHistoryEntry[],
   newMessage: string,
 ): Promise<string> => {
   try {
     const apiCall = async () => {
-      const chat = new AiChat({
-        history,
-        systemInstruction:
-          'You are Mia, a friendly and highly intelligent AI assistant embedded in a complex web application for developers. Be helpful and concise. Your primary role is to assist the user with understanding and operating the application.',
-      });
+      const chat = new AiChat({ history, systemInstruction: MIA_SYSTEM_INSTRUCTION });
       const { text } = await chat.sendMessage({ message: newMessage });
       return text;
     };
     return await withRetries(apiCall);
   } catch (error) {
     logFrontendError(error, ErrorSeverity.High, { context: 'getMiaChatResponse AI call' });
+    throw error;
+  }
+};
+
+// Streaming variant. onToken fires for each incremental delta as the model emits it.
+// Returns the full accumulated text once the stream completes. Same retry behavior
+// would have to be opted out of since retrying mid-stream is meaningless — we just
+// surface errors directly.
+export const getMiaChatResponseStream = async (
+  history: AiChatHistoryEntry[],
+  newMessage: string,
+  onToken: (delta: string) => void,
+): Promise<string> => {
+  try {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: MIA_SYSTEM_INSTRUCTION },
+      ...history.map(h => ({
+        role: (h.role === 'model' ? 'assistant' : 'user') as 'assistant' | 'user',
+        content: h.parts.map(p => p.text).join(''),
+      })),
+      { role: 'user', content: newMessage },
+    ];
+    const { text } = await callChatCompletionStream({ messages }, onToken);
+    return text;
+  } catch (error) {
+    logFrontendError(error, ErrorSeverity.High, { context: 'getMiaChatResponseStream AI call' });
     throw error;
   }
 };
@@ -820,7 +980,7 @@ ${JSON.stringify(errorLog, null, 2)}
     const apiCall = async () => {
       const { text } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
-        model: resolveModel(),
+        model: undefined,
       });
       return text;
     };
@@ -877,7 +1037,7 @@ ${projectContext}
   try {
     const apiCall = async () => {
       const { data, usage } = await generateJson(null, prompt, aiPlanResponseSchema, {
-        model: resolveModel(),
+        model: undefined,
       });
       return {
         clarifyingQuestions: [],

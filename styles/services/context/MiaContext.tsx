@@ -1,10 +1,10 @@
 
 // context/MiaContext.tsx
-import React, { createContext, useContext, useState, ReactNode, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, ReactNode, useEffect, useCallback, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { MiaMessage, MiaAlert, AiPlanResponse } from '@/types';
 import { appEventBus } from '@/lib/eventBus';
-import { getMiaChatResponse, getMiaErrorAnalysis, generateCodeFixPlan } from '@/styles/services/aiService';
+import { getMiaChatResponse, getMiaChatResponseStream, getMiaErrorAnalysis, generateCodeFixPlan } from '@/styles/services/aiService';
 import { logFrontendError, ErrorSeverity, parseApiError } from '@/utils/errorLogger';
 import { useMCPContext } from './MCPContext';
 import { INITIAL_DOCUMENTATION } from './constants';
@@ -67,6 +67,13 @@ export const MiaProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const [isRTActive, setIsRTActive] = useState<boolean>(false);
     const { extensionApi, status } = useMCPContext();
 
+    // Re-entry guards. State setters are async (React batches), so a fast second
+    // click can fire two parallel flows before isLoading/isGeneratingPlan/isApplyingFix
+    // reflect the first one. The refs flip synchronously and let us return early.
+    const diagnoseInflightRef = useRef<boolean>(false);
+    const generatePlanInflightRef = useRef<boolean>(false);
+    const applyFixInflightRef = useRef<boolean>(false);
+
     useEffect(() => {
         try {
             localStorage.setItem(MIA_MESSAGES_STORAGE_KEY, JSON.stringify(messages));
@@ -126,14 +133,24 @@ export const MiaProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
                 parts: [{ text: msg.text }]
             }));
 
-            const responseText = await getMiaChatResponse(history, messageText);
-
-            addMessage({
-                id: uuidv4(),
-                sender: 'mia',
-                text: responseText,
-                timestamp: new Date().toISOString(),
-            });
+            // Stream tokens into a placeholder Mia message. If the streaming call
+            // fails (server doesn't support SSE, network blip), fall back to the
+            // single-shot getMiaChatResponse so the user still gets a reply.
+            const replyId = uuidv4();
+            const replyTimestamp = new Date().toISOString();
+            addMessage({ id: replyId, sender: 'mia', text: '', timestamp: replyTimestamp });
+            let streamed = false;
+            try {
+                await getMiaChatResponseStream(history, messageText, (delta) => {
+                    streamed = true;
+                    setMessages(prev => prev.map(m => m.id === replyId ? { ...m, text: m.text + delta } : m));
+                });
+            } catch (streamErr) {
+                if (streamed) throw streamErr; // mid-stream failure surfaces as error
+                // Couldn't start a stream at all — try single-shot fallback.
+                const responseText = await getMiaChatResponse(history, messageText);
+                setMessages(prev => prev.map(m => m.id === replyId ? { ...m, text: responseText } : m));
+            }
             audioService.playSound('receive');
         } catch (error) {
             const userFriendlyMessage = parseApiError(error);
@@ -150,13 +167,15 @@ export const MiaProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }, [messages, addMessage]);
 
     const diagnoseLastError = useCallback(async () => {
+        if (diagnoseInflightRef.current) return;
         const lastCriticalError = alerts.find(a => a.severity === 'critical');
 
         if (!lastCriticalError || !lastCriticalError.context) {
             addMessage({ id: uuidv4(), sender: 'mia', text: "I couldn't find any recent critical errors to analyze.", timestamp: new Date().toISOString() });
             return;
         }
-        
+
+        diagnoseInflightRef.current = true;
         addMessage({ id: uuidv4(), sender: 'mia', text: `Analyzing the following error: "${lastCriticalError.title}"...`, timestamp: new Date().toISOString() });
         setIsLoading(true);
 
@@ -171,15 +190,18 @@ export const MiaProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             audioService.playSound('error');
         } finally {
             setIsLoading(false);
+            diagnoseInflightRef.current = false;
         }
     }, [alerts, addMessage]);
 
     const generateFixAttempt = useCallback(async (error: MiaAlert) => {
         if (!error.context) return;
-        
+        if (generatePlanInflightRef.current) return;
+        generatePlanInflightRef.current = true;
+
         setIsGeneratingPlan(true);
         setActivePlan(null);
-        setAgentLog([]); 
+        setAgentLog([]);
 
         try {
             const plan = await generateCodeFixPlan(error.context, INITIAL_DOCUMENTATION.projectContext);
@@ -209,49 +231,55 @@ export const MiaProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             audioService.playSound('error');
         } finally {
             setIsGeneratingPlan(false);
+            generatePlanInflightRef.current = false;
         }
     }, [addMessage]);
     
     const applyFix = useCallback(async () => {
         if (!activePlan) return;
+        if (applyFixInflightRef.current) return;
         if (status !== MCPConnectionStatus.Connected || !extensionApi?.fs) {
             addMessage({ id: uuidv4(), sender: 'system-error', text: "I can't apply the fix because the Browser Extension with File System Access is not connected. Please connect it in the Settings tab.", timestamp: new Date().toISOString() });
             audioService.playSound('error');
             return;
         }
 
+        applyFixInflightRef.current = true;
         setIsApplyingFix(true);
         const { implementationTasks } = activePlan;
 
-        for (const task of implementationTasks) {
-            if (task.filePath && task.newContent) {
-                try {
-                    addMessage({ id: uuidv4(), sender: 'system-progress', text: `Writing changes to ${task.filePath}...`, timestamp: new Date().toISOString() });
-                    await extensionApi.fs.saveFile(task.filePath, task.newContent);
-                    await new Promise(res => setTimeout(res, 500)); 
-                } catch (e) {
-                    const errorContext = { context: 'Mia.applyFix', file: task.filePath };
-                    logFrontendError(e, ErrorSeverity.Critical, errorContext);
-                    
-                    addMessage({ id: uuidv4(), sender: 'system-error', text: `Failed to write file: ${task.filePath}. Aborting fix.`, timestamp: new Date().toISOString() });
-                    
-                    addMessage({ 
-                        id: uuidv4(), 
-                        sender: 'mia', 
-                        text: "My attempt to apply the fix failed while writing a file. I have created a new critical alert with the failure details. You can use the 'Diagnose Last Error' button to investigate this new problem.", 
-                        timestamp: new Date().toISOString() 
-                    });
+        try {
+            for (const task of implementationTasks) {
+                if (task.filePath && task.newContent) {
+                    try {
+                        addMessage({ id: uuidv4(), sender: 'system-progress', text: `Writing changes to ${task.filePath}...`, timestamp: new Date().toISOString() });
+                        await extensionApi.fs.saveFile(task.filePath, task.newContent);
+                        await new Promise(res => setTimeout(res, 500));
+                    } catch (e) {
+                        const errorContext = { context: 'Mia.applyFix', file: task.filePath };
+                        logFrontendError(e, ErrorSeverity.Critical, errorContext);
 
-                    setIsApplyingFix(false);
-                    audioService.playSound('error');
-                    return;
+                        addMessage({ id: uuidv4(), sender: 'system-error', text: `Failed to write file: ${task.filePath}. Aborting fix.`, timestamp: new Date().toISOString() });
+
+                        addMessage({
+                            id: uuidv4(),
+                            sender: 'mia',
+                            text: "My attempt to apply the fix failed while writing a file. I have created a new critical alert with the failure details. You can use the 'Diagnose Last Error' button to investigate this new problem.",
+                            timestamp: new Date().toISOString()
+                        });
+
+                        audioService.playSound('error');
+                        return;
+                    }
                 }
             }
+            addMessage({ id: uuidv4(), sender: 'mia', text: "All file changes have been successfully applied. Please review the files in your editor.", timestamp: new Date().toISOString() });
+            setActivePlan(null);
+            audioService.playSound('success');
+        } finally {
+            setIsApplyingFix(false);
+            applyFixInflightRef.current = false;
         }
-        addMessage({ id: uuidv4(), sender: 'mia', text: "All file changes have been successfully applied. Please review the files in your editor.", timestamp: new Date().toISOString() });
-        setIsApplyingFix(false);
-        setActivePlan(null);
-        audioService.playSound('success');
     }, [activePlan, extensionApi, status, addMessage]);
 
 

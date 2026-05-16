@@ -86,7 +86,7 @@ Active tabs (rendered in MissionControl's switch):
 - **Control** — operator surface: health checks, Adam mode toggle, event log, learning panel
 - **Journal**, **Goals**, **A2A**, **Evolution** — the NEXUS suite, absorbed from the retired `:5173` frontend; depend on the NEXUS-PRIME backend at `localhost:8000`
 
-Orphan keys in `MissionControlTabKey` not currently rendered: `ui_builder`, `orchestrator`, `chat`, `anthropic_chat`, `serendipity_engine`. Either dead members from earlier scaffolding (candidates for removal), or scaffolded routes pending implementation. Audit before pruning.
+Orphan keys previously in `MissionControlTabKey` were pruned 2026-05-16: `ui_builder`, `orchestrator`, `anthropic_chat`, `serendipity_engine`. Their component dirs (`hooks/components/ui_builder/`, `hooks/components/orchestrator/`, `hooks/components/mission_control/Orchestrator.tsx`) were deleted. The `chat` key is **not** an orphan — it lazy-imports `hooks/components/chat/Chat.tsx` and renders in MissionControl.
 
 ### AI service contract — `styles/services/aiService.ts`
 

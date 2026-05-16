@@ -801,3 +801,47 @@ Closes the gap CLAUDE.md flagged: *"There is no `AbortController` integration ye
 3. Mia's auto-fix `applyFix` / `generateFixAttempt` flows route through `aiService` and ARE cancellable — but the Mia context tracks its own `activePlan` state, which will go stale if the user cancels mid-flow. CLAUDE.md already flags MiaContext as having no mutex; this change doesn't make it worse, but a Mia-aware abort might want to clear `activePlan` on cancel. Future work.
 
 **Verification.** `npx tsc --noEmit` — no new errors. Vite HMR picked up the changes cleanly: `eventBus.ts` triggered a full page reload (correct — not a React component), `aiService.ts` + `App.tsx` hot-updated. Live smoke pending operator: run a Shunt transform, see the button appear bottom-right, click it, confirm the request aborts and the UI surfaces the "Generation cancelled by user." error.
+
+### Repository initialized and pushed (2026-05-16)
+
+Operator confirmed; first commit landed publicly.
+
+- **`git init -b main`** in repo root, `user.email=halkive@gmail.com`, `user.name=Falki` (local config; global config left untouched).
+- **`origin`** set to `https://github.com/QFiSouthaven/Shunt_final_V.git` (was an empty repo on GitHub).
+- **`.gitignore`** extended on top of the existing Vite-default ignore. New entries cover: `**/.next/`, `**/.turbo/`, `**/.vite/`, `*.tsbuildinfo`, `.wrangler/`, `.claude/settings.local.json`, `Thumbs.db`/`Desktop.ini`, all `hub-bus/` runtime state (`inbox/`, `outbox/`, `.processing/`, `archive/`, `dlq/`, `transcript.jsonl`, `presence.json`, `.presence.*`, `.seq.*`, `*.tmp`), `zip/` + `zip.zip`, `Conversation history/`, `phase-4-tsc.txt`, `pattern-z-baseline-hashes.txt`, and the malformed `CUsers...hub-bus/` ghost dir (matched via ASCII wildcard `C*Users*Falki*shunt-final-v*hub-bus/`).
+- **`.claude/settings.json`** created with two allowlist entries (`Bash(npm run dev)`, `Bash(npx tsc --noEmit)`) — **note:** inert under current `defaultMode: bypassPermissions` global, but standing safety net.
+- **Initial commit `de9bfcc`** — 439 files, ~5.5 MB. Secret scan (`sk-*`, `ghp_*`, `AIza*`, `xoxb-*`, `aws_secret_access_key`, `BEGIN PRIVATE KEY`) ran clean before commit.
+- **Pushed to `origin/main`.** Remote tip matches local: `de9bfcc90c545cc0ad77aaad190f9c13c6de20ec`. Branch tracking set up.
+
+**Operator-relevant items now public on GitHub:**
+- Cloudflare account ID (`c6e9f3ff...`), KV namespace ID (`80e03b13...`), D1 database ID (`d04...c7ed24`) — these are resource identifiers, NOT credentials. They don't grant access on their own, but they're enumerable.
+- All operational docs (`ADMIN_TERMINAL_KICKOFF_*`, `COWORK_HANDOFF`, `STATE_SNAPSHOT`, `HANDBOOK`, this build log).
+- `hub-bus/PROTOCOL.md`, `participants.json` seed, `README.md` — protocol surface is documented.
+
+**Next-step recommendations.** (1) Decide if the repo on GitHub should be public or private — set visibility in repo settings if not already done. (2) For future commits: now that the safety net exists, code changes I make can be reviewed via `git diff` and rolled back atomically instead of re-reading files turn-over-turn. (3) Consider adding a `.github/workflows/typecheck.yml` to run `npx tsc --noEmit` on PRs once the repo gets multi-contributor activity.
+
+### Phase A — Personal SPA polish (2026-05-16)
+
+Operator chose sequenced finish-line: **A (personal SPA) → B (cross-machine hub) → C (P1 hardening)** across 3–4 sessions. Phase A landed in one turn.
+
+**A.1 — Auto-detect default model from `/v1/models`.** `styles/services/aiService.ts`: `resolveModel` is now `async`; when no caller-provided model AND configured `aiModel` is the placeholder `'local-model'`, probes `${baseUrl/v1/models}` once per session (cached per baseUrl, with a single inflight `Promise` per probe to prevent thundering-herd on first call), takes the first id from `data[0].id`. Falls back to `'local-model'` if the probe fails. All 17 call sites that used `model: resolveModel(...)` simplified to either `model: modelName` or `model: undefined` — resolution happens inside `callChatCompletion` now. `generateRawText`'s `modelName: string` widened to `modelName?: string` to allow `undefined`. **Eliminates the "first call 404s on unknown model id" friction** that blocked operator smoke-test in earlier sessions.
+
+**A.2 — Orphan tab pruning.** CLAUDE.md flagged 5 keys not rendered. Audit found 4 actually orphan (`ui_builder`, `orchestrator`, `anthropic_chat`, `serendipity_engine`) and 1 false-flag (`chat` IS lazy-imported and rendered at MissionControl.tsx:92). Removed the 4 keys from `MissionControlTabKey` union in `types/index.ts`. Deleted 8 dead files via `git rm`:
+- `hooks/components/ui_builder/UIBuilder.tsx`
+- `hooks/components/orchestrator/{CustomOrchestratorNode,NodeDetailsPanel}.tsx` + `nodes/{AudioOutputNode,AudioSourceNode,UIEventNode}.tsx`
+- `hooks/components/mission_control/Orchestrator.tsx`
+- `types/index.ts.bak.4` (stale backup, was caught in initial commit)
+Updated CLAUDE.md to reflect the new state.
+
+**A.3 — Mia mutex.** `styles/services/context/MiaContext.tsx`: added three `useRef<boolean>` re-entry guards — `diagnoseInflightRef`, `generatePlanInflightRef`, `applyFixInflightRef`. Each function returns early if its ref is already true, flips it true after the entry checks, and resets it in `finally`. Refs flip synchronously (state setters are async + batched, so the original `isLoading`/`isGeneratingPlan`/`isApplyingFix` checks couldn't gate fast double-clicks). `applyFix` was also restructured: its body is now wrapped in `try/finally` so the ref always resets even on the early-return file-write error path. Closes the race CLAUDE.md flagged.
+
+**A.4 — Streaming responses.** New `callChatCompletionStream(opts, onToken)` in `aiService.ts`: same controller registration + Stop-button cancellation as the non-streaming path, but consumes SSE chunks from `stream: true`. Buffers and splits on `\n\n` frame boundaries, parses each `data:` line, extracts `choices[0].delta.content`, fires `onToken(delta)` per token. Tolerates malformed frames (some servers send keepalive comments). New `getMiaChatResponseStream(history, message, onToken)` wraps it for Mia. **Wired to MiaContext.sendMessage**: places a placeholder Mia message immediately, mutates its text via `setMessages(prev => ...)` per token. If streaming fails before the first token, falls back to `getMiaChatResponse` (single-shot) so the user still gets a reply. If streaming fails mid-stream, surfaces the error (no fallback — fallback would duplicate the partial output). **Other call sites (Shunt, Weaver, Foundry, etc.) left on single-shot** — they're one-shot transforms, not chat, so streaming has lower UX value there. Hook is in place for future opt-in.
+
+**A.5 — Smoke checklist for operator.** New `docs/PHASE_A_SMOKE_CHECKLIST.md`. Covers boot, Settings, every active tab, Mia, Stop button behavior, and explicit "expected partial" callouts for Hub/Control/A2A/Journal/Goals/Evolution (the tabs that need Phase B's bus + the NEXUS-PRIME backend). Operator runs through it, hands back any failures, Phase A closes when nothing critical is red.
+
+**Verification.** `npx tsc --noEmit` clean after every change (only pre-existing unrelated error in `tools/organize-conversation-history.mjs:684`). Vite HMR picked up all updates. Live smoke pending operator pass-through of the checklist.
+
+**Not done in Phase A (intentionally deferred):**
+- Streaming for non-chat call sites (Shunt/Weaver/etc.) — low UX value, defer until requested.
+- The hardcoded "3D-artist + Virt-a-Mate JSON preset" in `analyzeImage` (CLAUDE.md flags it as non-generic) — operator-specific feature; rewrite only if it conflicts with smoke-test goals.
+- Kill the PID-4540 zombie node on :3000 — operator action; documented in earlier 2026-05-15 entry.

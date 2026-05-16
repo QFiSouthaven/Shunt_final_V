@@ -72,8 +72,8 @@ export interface HistoryEntry {
     score: number;
 }
 
-// Removed 'terminal', 'deploy', 'developers'
-export type MissionControlTabKey = 'hub' | 'control_panel' | 'journal' | 'goals' | 'a2a' | 'evolution' | 'shunt' | 'weaver' | 'foundry' | 'ui_builder' | 'chat' | 'orchestrator' | 'image_analysis' | 'oraculum' | 'documentation' | 'settings' | 'anthropic_chat' | 'subscription' | 'serendipity_engine' | 'chronicle' | 'tool_for_ai' | 'framework' | 'mod' | 'diagnostics';
+// Removed 'terminal', 'deploy', 'developers', 'ui_builder', 'orchestrator', 'anthropic_chat', 'serendipity_engine'
+export type MissionControlTabKey = 'hub' | 'control_panel' | 'journal' | 'goals' | 'a2a' | 'evolution' | 'shunt' | 'weaver' | 'foundry' | 'chat' | 'image_analysis' | 'oraculum' | 'documentation' | 'settings' | 'subscription' | 'chronicle' | 'tool_for_ai' | 'framework' | 'mod' | 'diagnostics';
 
 export interface MissionControlTab {
     key: MissionControlTabKey;
