@@ -1,0 +1,1583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Aether Splicer</title>
+<!--
+  Desktop-wrapped copy of hub-bus-panel/splicer.html.
+  Differences from the browser original:
+    * Bearer credential is preferred from window.coworkSecret (Electron
+      safeStorage / Windows Credential Vault). Falls back to localStorage if
+      coworkSecret is absent (so this file still works in a plain browser).
+    * Incoming envelopes addressed to @zack fire a native Notification when
+      the window is hidden / minimized to tray.
+  Everything else mirrors the browser version. Keep parseInput / buildWsUrl
+  in sync with hub-bus-panel/splicer.html.
+-->
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c232c;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --text-dim2: #6e7681;
+    --green: #3fb950;
+    --gray: #6e7681;
+    --blue: #388bfd;
+    --blue2: #58a6ff;
+    --red: #f85149;
+    --purple: #a371f7;
+    --yellow: #d29922;
+    --me-bubble: #1f3a5e;
+    --mono: ui-monospace, "SF Mono", Consolas, Monaco, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: transparent; color: var(--text);
+    font-family: var(--sans); font-size: 12px;
+    height: 100%;
+  }
+  body {
+    background: var(--bg);
+    display: flex; align-items: stretch; justify-content: stretch;
+    min-height: 100vh;
+    padding: 0; margin: 0;
+  }
+
+  /* WIDGET FRAME — desktop fills the window */
+  .widget {
+    width: 100%; height: 100vh;
+    background: var(--bg);
+    border: none;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+  .widget.hidden { display: none; }
+
+  /* MINIMIZED BUBBLE (kept for parity; usually hidden in desktop mode) */
+  .bubble-min {
+    position: fixed; bottom: 16px; right: 16px;
+    width: 60px; height: 60px;
+    border-radius: 50%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    display: none;
+    align-items: center; justify-content: center;
+    cursor: pointer; z-index: 100;
+    color: var(--text);
+    font-family: var(--mono); font-size: 11px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  .bubble-min.show { display: flex; flex-direction: column; }
+  .bubble-min .label { font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+  .bubble-min .count { font-size: 16px; font-weight: 700; color: var(--blue2); }
+  .bubble-min:hover { background: var(--panel2); border-color: var(--blue); }
+
+  /* TOPBAR */
+  .topbar {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 6px 10px;
+    display: flex; align-items: center; gap: 8px;
+    flex: 0 0 auto;
+    font-size: 11px;
+  }
+  .topbar .host {
+    font-family: var(--mono); color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 200px;
+  }
+  .topbar .me-jid {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--text-dim);
+  }
+  .topbar .conn-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--gray); display: inline-block;
+    flex: 0 0 auto;
+  }
+  .topbar .conn-dot.ok  { background: var(--green); }
+  .topbar .conn-dot.warn { background: var(--yellow); animation: dotPulse 1.2s infinite; }
+  .topbar .conn-dot.err { background: var(--red); }
+  @keyframes dotPulse {
+    0%,100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .topbar .grow { flex: 1; }
+  .topbar button {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 7px; font-size: 11px; cursor: pointer; font-family: var(--sans);
+  }
+  .topbar button:hover { background: var(--border); }
+
+  /* FEED */
+  .feed-wrap {
+    flex: 1 1 auto; min-height: 0;
+    overflow: hidden; position: relative;
+    background: var(--bg);
+  }
+  .feed {
+    position: absolute; inset: 0;
+    overflow-y: auto; overflow-x: hidden;
+    padding: 6px 10px;
+    scroll-behavior: smooth;
+  }
+  .feed-empty {
+    padding: 16px; color: var(--text-dim); font-size: 11px;
+    text-align: center; line-height: 1.5;
+  }
+  .row {
+    margin: 6px 0; padding: 4px 0;
+    border-bottom: 1px dashed transparent;
+  }
+  .row .meta {
+    display: flex; gap: 5px; align-items: baseline;
+    font-size: 10px; color: var(--text-dim);
+    margin-bottom: 2px; flex-wrap: wrap;
+  }
+  .row .meta .author {
+    font-family: var(--mono); font-weight: 700; font-size: 11px;
+  }
+  .row .meta .arrow { color: var(--text-dim2); }
+  .row .meta .to {
+    font-family: var(--mono); font-size: 11px;
+  }
+  .row .meta .ts { font-family: var(--mono); }
+  .row .meta .id { font-family: var(--mono); color: var(--text-dim2); }
+  .row .meta .badge {
+    font-family: var(--mono); font-size: 9px;
+    padding: 1px 4px; border-radius: 3px;
+    text-transform: uppercase; border: 1px solid transparent;
+    font-weight: 700;
+  }
+  .badge.kind-task,
+  .badge.kind-request_aid,
+  .badge.kind-request,
+  .badge.kind-event       { background: #0d2a4a; color: var(--blue);   border-color: #1f3a5e; }
+  .badge.kind-response,
+  .badge.kind-reply       { background: #0d2818; color: var(--green);  border-color: #1f3a25; }
+  .badge.kind-error       { background: #3a0d0d; color: var(--red);    border-color: #5a1f1f; }
+  .badge.kind-presence,
+  .badge.kind-join,
+  .badge.kind-leave,
+  .badge.kind-system      { background: var(--panel2); color: var(--text-dim); border-color: var(--border); }
+  .badge.kind-broadcast   { background: #2a0d3a; color: var(--purple); border-color: #4a1f5e; }
+  .body-preview {
+    font-size: 12px; color: var(--text);
+    font-family: var(--sans); line-height: 1.4;
+    white-space: pre-wrap; word-break: break-word;
+    cursor: pointer;
+    max-height: 4.4em; overflow: hidden;
+    position: relative;
+  }
+  .body-preview.expanded { max-height: none; }
+  .body-preview .fade {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    height: 14px;
+    background: linear-gradient(to bottom, transparent, var(--bg));
+    pointer-events: none;
+  }
+  .body-preview.expanded .fade { display: none; }
+
+  /* INPUT */
+  .input-bar {
+    flex: 0 0 auto;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 6px 8px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .input-row1 {
+    display: flex; gap: 6px; align-items: center;
+    font-size: 11px;
+  }
+  .floor-pill {
+    font-family: var(--mono); font-size: 10px;
+    padding: 2px 6px; border-radius: 8px;
+    background: var(--panel2); border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .target-pill {
+    font-family: var(--mono); font-size: 10px;
+    padding: 2px 6px; border-radius: 8px;
+    background: #0d2a4a; border: 1px solid #1f3a5e;
+    color: var(--blue);
+  }
+  .input-row2 { display: flex; gap: 6px; align-items: stretch; }
+  .input-row2 input {
+    flex: 1; min-width: 0;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 8px; font-family: var(--mono); font-size: 12px;
+    outline: none;
+  }
+  .input-row2 input:focus { border-color: var(--blue); }
+  .input-row2 button.send {
+    background: var(--blue); color: #fff; border: none;
+    padding: 4px 12px; border-radius: 4px; cursor: pointer;
+    font-family: var(--sans); font-size: 12px; font-weight: 600;
+  }
+  .input-row2 button.send:disabled { opacity: 0.5; cursor: not-allowed; }
+  .input-hint { font-size: 10px; color: var(--text-dim); font-family: var(--mono); min-height: 12px; }
+  .input-hint.err { color: var(--red); }
+  .input-hint.ok  { color: var(--green); }
+  .recon-banner {
+    background: #3a2a0d; color: var(--yellow);
+    font-size: 10px; font-family: var(--mono);
+    padding: 4px 8px; text-align: center;
+    border-bottom: 1px solid #5a4a1f;
+  }
+  .recon-banner.hidden { display: none; }
+
+  /* SETUP / CONNECTING */
+  .setup, .connecting {
+    flex: 1 1 auto; min-height: 0;
+    display: flex; flex-direction: column;
+    padding: 14px 16px; overflow-y: auto;
+  }
+  .setup h2, .connecting h2 {
+    margin: 0 0 8px 0; font-size: 14px; color: var(--text);
+  }
+  .setup .sub {
+    color: var(--text-dim); font-size: 11px; margin-bottom: 12px;
+  }
+  .setup label {
+    display: block; font-size: 11px; color: var(--text-dim);
+    margin: 8px 0 3px 0; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .setup input {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 8px; border-radius: 4px;
+    font-family: var(--mono); font-size: 12px;
+    outline: none;
+  }
+  .setup input:focus { border-color: var(--blue); }
+  .setup .actions {
+    display: flex; gap: 8px; margin-top: 14px;
+  }
+  .setup button.primary {
+    background: var(--blue); color: #fff; border: none;
+    padding: 6px 14px; border-radius: 4px; cursor: pointer;
+    font-size: 12px; font-weight: 600;
+  }
+  .setup button.secondary {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    padding: 6px 14px; border-radius: 4px; cursor: pointer;
+    font-size: 12px;
+  }
+  .setup .warn {
+    margin-top: 10px;
+    background: #3a2a0d; border: 1px solid #5a4a1f; color: var(--yellow);
+    padding: 6px 8px; border-radius: 4px; font-size: 10px; line-height: 1.4;
+  }
+  .setup .ok-banner {
+    margin-top: 10px;
+    background: #0d2818; border: 1px solid #1f3a25; color: var(--green);
+    padding: 6px 8px; border-radius: 4px; font-size: 10px; line-height: 1.4;
+  }
+  .setup .err {
+    margin-top: 10px;
+    background: #3a0d0d; border: 1px solid #5a1f1f; color: var(--red);
+    padding: 6px 8px; border-radius: 4px; font-size: 11px; font-family: var(--mono);
+    word-break: break-word;
+  }
+  .connecting .spinner-line {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px;
+  }
+  .connecting .spinner {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--yellow); animation: dotPulse 1.2s infinite;
+  }
+  .connecting button {
+    margin-top: 14px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 6px 12px; cursor: pointer; font-size: 12px;
+    align-self: flex-start;
+  }
+
+  /* HELP popup */
+  .help-overlay {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    max-height: 65%;
+    background: var(--panel); border-top: 1px solid var(--border);
+    padding: 10px 12px; overflow-y: auto;
+    z-index: 25;
+    font-size: 11px;
+    transform: translateY(100%); transition: transform 0.18s;
+  }
+  .help-overlay.open { transform: translateY(0); }
+  .help-overlay h4 { margin: 0 0 6px 0; font-size: 12px; }
+  .help-overlay table { width: 100%; border-collapse: collapse; font-family: var(--mono); }
+  .help-overlay td { padding: 2px 6px 2px 0; vertical-align: top; }
+  .help-overlay td:first-child { color: var(--blue2); white-space: nowrap; }
+  .help-overlay .close-x {
+    position: absolute; top: 4px; right: 8px;
+    background: transparent; border: none; color: var(--text-dim);
+    font-size: 16px; cursor: pointer;
+  }
+
+  /* Ctrl+K command palette (splicer-scoped overlay) */
+  .cmdk-overlay {
+    position: absolute; inset: 0;
+    background: rgba(13, 17, 23, 0.86);
+    z-index: 40;
+    display: none;
+    flex-direction: column;
+    padding: 28px 14px 14px 14px;
+  }
+  .cmdk-overlay.open { display: flex; }
+  .cmdk-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    flex: 1 1 auto; min-height: 0;
+  }
+  .cmdk-search {
+    background: var(--panel2);
+    color: var(--text);
+    border: none;
+    border-bottom: 1px solid var(--border);
+    padding: 8px 10px;
+    font-family: var(--mono); font-size: 12px;
+    outline: none;
+    flex: 0 0 auto;
+  }
+  .cmdk-search::placeholder { color: var(--text-dim2); }
+  .cmdk-list {
+    flex: 1 1 auto; min-height: 0;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .cmdk-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text);
+    border-left: 2px solid transparent;
+  }
+  .cmdk-row.active {
+    background: var(--panel2);
+    border-left-color: var(--blue);
+  }
+  .cmdk-row:hover { background: var(--panel2); }
+  .cmdk-glyph {
+    width: 16px; flex: 0 0 auto;
+    text-align: center;
+    font-family: var(--mono); font-weight: 700;
+    color: var(--blue2);
+  }
+  .cmdk-row .cmdk-glyph.peer-on  { color: var(--green); }
+  .cmdk-row .cmdk-glyph.peer-off { color: var(--text-dim2); }
+  .cmdk-row .cmdk-glyph.room     { color: var(--purple); }
+  .cmdk-row .cmdk-glyph.action   { color: var(--yellow); }
+  .cmdk-label {
+    flex: 1 1 auto;
+    font-family: var(--mono);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cmdk-secondary {
+    color: var(--text-dim);
+    font-size: 11px;
+    font-family: var(--mono);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 50%;
+  }
+  .cmdk-empty {
+    padding: 16px; text-align: center;
+    color: var(--text-dim); font-size: 11px;
+  }
+  .cmdk-footer {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border);
+    background: var(--panel2);
+    color: var(--text-dim2);
+    font-family: var(--mono); font-size: 10px;
+  }
+</style>
+</head>
+<body>
+
+<div id="bubble-min" class="bubble-min" title="Restore splicer">
+  <span class="label">splicer</span>
+  <span class="count" id="bubble-count">0</span>
+</div>
+
+<div id="widget" class="widget">
+
+  <!-- Setup view -->
+  <div id="view-setup" class="setup" style="display:none;">
+    <h2>Aether Splicer</h2>
+    <div class="sub">Bolt-on chat widget that splices into the Aether Shunt bus over WebSocket.</div>
+
+    <label for="cfg-url">Worker URL</label>
+    <input type="text" id="cfg-url" placeholder="https://hub-relay.halkive.workers.dev" />
+
+    <label for="cfg-bearer">Bearer secret</label>
+    <input type="password" id="cfg-bearer" placeholder="HUB_API_SECRET" autocomplete="off" />
+
+    <label for="cfg-jid">JID-as</label>
+    <input type="text" id="cfg-jid" placeholder="@splicer-xxxx" />
+
+    <label for="cfg-room">Default room</label>
+    <input type="text" id="cfg-room" placeholder="#main" />
+
+    <div class="actions">
+      <button class="primary" id="cfg-save">Save & Connect</button>
+      <button class="secondary" id="cfg-cancel" style="display:none;">Cancel</button>
+    </div>
+
+    <div id="cfg-storage-banner" class="warn">
+      Bearer is stored in this browser's localStorage. Anyone with access to this browser can read it.
+      Use a domain-scoped browser profile if exposing publicly.
+    </div>
+    <div id="cfg-err" class="err" style="display:none;"></div>
+  </div>
+
+  <!-- Connecting view -->
+  <div id="view-connecting" class="connecting" style="display:none;">
+    <div class="spinner-line">
+      <span class="spinner"></span>
+      <span id="connecting-msg">Connecting…</span>
+    </div>
+    <button id="connecting-cancel">Cancel</button>
+  </div>
+
+  <!-- Live view -->
+  <div id="view-live" style="display:none; flex:1 1 auto; min-height:0; flex-direction:column;">
+    <div class="topbar">
+      <span id="conn-dot" class="conn-dot" title="Disconnected"></span>
+      <span class="host" id="host-label">—</span>
+      <span class="grow"></span>
+      <span class="me-jid" id="me-jid">—</span>
+      <button id="btn-gear" title="Settings">&#9881;</button>
+      <button id="btn-min" title="Minimize">&times;</button>
+    </div>
+    <div id="recon-banner" class="recon-banner hidden">reconnecting…</div>
+    <div class="feed-wrap">
+      <div id="feed" class="feed">
+        <div class="feed-empty" id="feed-empty">
+          No history available — splicer only shows envelopes received since you connected.
+        </div>
+      </div>
+      <div class="help-overlay" id="help-overlay">
+        <button class="close-x" id="help-close">&times;</button>
+        <h4>Splicer commands</h4>
+        <table>
+          <tr><td>/help</td><td>Show this help.</td></tr>
+          <tr><td>/to @addr &lt;body&gt;</td><td>Send to a specific peer.</td></tr>
+          <tr><td>/whisper @addr &lt;body&gt;</td><td>Direct in #whisper-* room.</td></tr>
+          <tr><td>/broadcast &lt;body&gt;</td><td>Send with to:*.</td></tr>
+          <tr><td>/who</td><td>Show recent peers (presence ≤ 90s).</td></tr>
+          <tr><td>/clear</td><td>Clear local feed (bus untouched).</td></tr>
+          <tr><td>/quit · /disconnect</td><td>Close WS, return to disconnected.</td></tr>
+          <tr><td>plain text</td><td>Send to current room as kind:'task'.</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="input-bar">
+      <div class="input-row1">
+        <span class="floor-pill" id="floor-pill">live</span>
+        <span class="target-pill" id="target-pill">#main</span>
+      </div>
+      <div class="input-row2">
+        <input type="text" id="composer" placeholder="message · /help for commands" autocomplete="off" />
+        <button id="send-btn" class="send">Send</button>
+      </div>
+      <div id="hint" class="input-hint">Enter to send · /help for commands</div>
+    </div>
+  </div>
+
+  <!-- Ctrl+K command palette (overlay) -->
+  <div id="cmdk-overlay" class="cmdk-overlay" role="dialog" aria-label="Command palette">
+    <div class="cmdk-box">
+      <input type="text" id="cmdk-search" class="cmdk-search"
+             placeholder="Type a command, peer, or room…"
+             autocomplete="off" spellcheck="false" />
+      <div id="cmdk-list" class="cmdk-list"></div>
+      <div class="cmdk-footer">↑↓ navigate · Enter select · Esc close</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ─── Hash-color (KEEP IN SYNC with hub-bus-panel/index.html colorFor) ─────
+  function colorFor(name) {
+    if (!name) return 'var(--text-dim)';
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < name.length; i++) {
+      h ^= name.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return 'hsl(' + (h % 360) + ', 65%, 70%)';
+  }
+
+  function parseInput(text, defaultRoom) {
+    defaultRoom = defaultRoom || '#main';
+    if (text == null) return { kind: 'noop' };
+    const trimmed = String(text).trim();
+    if (!trimmed) return { kind: 'noop' };
+    if (trimmed[0] !== '/') {
+      return { kind: 'send', to: defaultRoom, body: text, sendKind: 'task' };
+    }
+    const rest = trimmed.slice(1);
+    const sp = rest.indexOf(' ');
+    const verb = (sp === -1 ? rest : rest.slice(0, sp)).toLowerCase();
+    const tail = sp === -1 ? '' : rest.slice(sp + 1).trim();
+    switch (verb) {
+      case 'help':
+      case '?':
+        return { kind: 'cmd', name: 'help' };
+      case 'clear':
+        return { kind: 'cmd', name: 'clear' };
+      case 'who':
+        return { kind: 'cmd', name: 'who' };
+      case 'quit':
+      case 'disconnect':
+        return { kind: 'cmd', name: 'quit' };
+      case 'to': {
+        if (!tail) return { kind: 'error', message: 'usage: /to @addr <body>' };
+        const m = tail.match(/^(@\S+|#\S+|\*)\s+([\s\S]+)$/);
+        if (!m) return { kind: 'error', message: 'usage: /to @addr <body>' };
+        return { kind: 'send', to: m[1], body: m[2], sendKind: 'task' };
+      }
+      case 'whisper': {
+        if (!tail) return { kind: 'error', message: 'usage: /whisper @addr <body>' };
+        const m = tail.match(/^(@\S+)\s+([\s\S]+)$/);
+        if (!m) return { kind: 'error', message: 'usage: /whisper @addr <body>' };
+        const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+          ? crypto.randomUUID().slice(0, 8)
+          : Math.random().toString(36).slice(2, 10);
+        return { kind: 'send', to: m[1], body: m[2], sendKind: 'task', room: '#whisper-' + id };
+      }
+      case 'broadcast': {
+        if (!tail) return { kind: 'error', message: 'usage: /broadcast <body>' };
+        return { kind: 'send', to: '*', body: tail, sendKind: 'broadcast' };
+      }
+      default:
+        return { kind: 'error', message: 'unknown command: /' + verb + ' — try /help' };
+    }
+  }
+
+  function buildWsUrl(workerUrl, room, jid, token) {
+    const u = new URL(workerUrl);
+    const wsProto = (u.protocol === 'https:') ? 'wss:' : 'ws:';
+    const params = new URLSearchParams();
+    params.set('room', room);
+    params.set('jid', jid);
+    params.set('token', token);
+    return wsProto + '//' + u.host + '/ws?' + params.toString();
+  }
+
+  // ─── Config storage ───────────────────────────────────────────────────────
+  // Non-secret config lives in localStorage as JSON. The bearer secret is
+  // separated: in desktop mode it goes through window.coworkSecret
+  // (Electron safeStorage / Windows Credential Vault); in browser mode it
+  // stays in localStorage alongside the rest of the config.
+  const CFG_KEY = 'aether_splicer_config';
+  const HAS_SAFE_STORAGE = !!(window.coworkSecret && typeof window.coworkSecret.get === 'function');
+
+  function loadCfgRaw() {
+    try {
+      const raw = localStorage.getItem(CFG_KEY);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== 'object') return null;
+      return obj;
+    } catch (e) { return null; }
+  }
+
+  async function loadCfg() {
+    const obj = loadCfgRaw();
+    if (!obj) return null;
+    if (HAS_SAFE_STORAGE) {
+      try {
+        const sec = await window.coworkSecret.get();
+        if (sec) obj.bearer = sec;
+        else if (!obj.bearer) obj.bearer = '';
+      } catch (e) { /* ignore — fall back to whatever obj had */ }
+    }
+    return obj;
+  }
+
+  async function saveCfg(cfg) {
+    const toStore = { ...cfg };
+    if (HAS_SAFE_STORAGE) {
+      // Persist bearer through safeStorage; strip it from localStorage.
+      try {
+        await window.coworkSecret.set(cfg.bearer || '');
+      } catch (e) { console.error('safeStorage set failed', e); }
+      delete toStore.bearer;
+    }
+    localStorage.setItem(CFG_KEY, JSON.stringify(toStore));
+  }
+
+  function defaultJid() {
+    const r = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID().slice(0, 4)
+      : Math.random().toString(36).slice(2, 6);
+    return '@splicer-' + r;
+  }
+
+  // ─── State ────────────────────────────────────────────────────────────────
+  const RING_MAX = 200;
+  const ring = [];
+  const seen = new Set();
+  const presenceLast = {};
+  let cfg = null;
+  let ws = null;
+  let connectedHostname = '';
+  let lastError = '';
+  let reconnectAttempts = 0;
+  let reconnectTimer = null;
+  let manualDisconnect = false;
+  let minimized = false;
+  let unread = 0;
+  let view = 'setup';
+
+  // ─── DOM refs ─────────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const widget = $('widget');
+  const bubbleMin = $('bubble-min');
+  const bubbleCount = $('bubble-count');
+  const viewSetup = $('view-setup');
+  const viewConnecting = $('view-connecting');
+  const viewLive = $('view-live');
+  const cfgUrl = $('cfg-url');
+  const cfgBearer = $('cfg-bearer');
+  const cfgJid = $('cfg-jid');
+  const cfgRoom = $('cfg-room');
+  const cfgErr = $('cfg-err');
+  const cfgSave = $('cfg-save');
+  const cfgCancel = $('cfg-cancel');
+  const cfgStorageBanner = $('cfg-storage-banner');
+  const connectingMsg = $('connecting-msg');
+  const connectingCancel = $('connecting-cancel');
+  const connDot = $('conn-dot');
+  const hostLabel = $('host-label');
+  const meJidLabel = $('me-jid');
+  const reconBanner = $('recon-banner');
+  const feedEl = $('feed');
+  const feedEmpty = $('feed-empty');
+  const composer = $('composer');
+  const sendBtn = $('send-btn');
+  const hintEl = $('hint');
+  const targetPill = $('target-pill');
+  const floorPill = $('floor-pill');
+  const helpOverlay = $('help-overlay');
+
+  // Re-style the storage notice when running under Electron safeStorage.
+  if (HAS_SAFE_STORAGE && cfgStorageBanner) {
+    cfgStorageBanner.className = 'ok-banner';
+    cfgStorageBanner.textContent =
+      'Bearer is stored in the OS keychain (Windows Credential Vault) via Electron safeStorage. ' +
+      'Local processes running as your user can still read it.';
+  }
+
+  function setView(v) {
+    view = v;
+    viewSetup.style.display = (v === 'setup') ? 'flex' : 'none';
+    viewConnecting.style.display = (v === 'connecting') ? 'flex' : 'none';
+    viewLive.style.display = (v === 'live') ? 'flex' : 'none';
+  }
+
+  function setHint(text, level) {
+    hintEl.textContent = text || 'Enter to send · /help for commands';
+    hintEl.classList.remove('err', 'ok');
+    if (level === 'err') hintEl.classList.add('err');
+    else if (level === 'ok') hintEl.classList.add('ok');
+  }
+
+  function setConnDot(state, msg) {
+    connDot.classList.remove('ok', 'warn', 'err');
+    if (state === 'ok')   connDot.classList.add('ok');
+    else if (state === 'warn') connDot.classList.add('warn');
+    else if (state === 'err')  connDot.classList.add('err');
+    if (msg) { connDot.title = msg; lastError = msg; }
+  }
+
+  function shortId(id) { return id ? String(id).slice(0, 8) : '????????'; }
+  function fmtTime(iso) {
+    if (!iso) return '--:--:--';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '--:--:--';
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const s = String(d.getSeconds()).padStart(2, '0');
+    return h + ':' + m + ':' + s;
+  }
+  function bodyToText(body) {
+    if (typeof body === 'string') return body;
+    if (body == null) return '';
+    try { return JSON.stringify(body, null, 2); } catch (e) { return String(body); }
+  }
+
+  // ─── Notification helper (desktop-aware) ──────────────────────────────────
+  // Fire a native notification when an envelope addressed to @zack arrives
+  // and the window isn't focused. Web Notification API works in Electron and
+  // in browsers that have granted permission.
+  function maybeNotify(env) {
+    if (!env || env.to !== '@zack') return;
+    if (document.hasFocus && document.hasFocus()) return;
+    const title = (env.from || '?') + ' → @zack';
+    const bodyTxt = bodyToText(env.body).slice(0, 200);
+    try {
+      if ('Notification' in window) {
+        if (Notification.permission === 'granted') {
+          const n = new Notification(title, { body: bodyTxt, silent: false });
+          n.onclick = () => { try { window.focus(); } catch (e) {} };
+          return;
+        }
+        if (Notification.permission !== 'denied') {
+          Notification.requestPermission().then((p) => {
+            if (p === 'granted') {
+              try { new Notification(title, { body: bodyTxt }); } catch (e) {}
+            }
+          });
+          return;
+        }
+      }
+      // Fallback to IPC helper if it exists.
+      if (typeof window.coworkNotify === 'function') {
+        window.coworkNotify(title, bodyTxt);
+      }
+    } catch (e) { /* ignore notification failures */ }
+  }
+
+  // ─── Feed rendering ───────────────────────────────────────────────────────
+  function makeRow(env) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.dataset.id = env.id || '';
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const author = document.createElement('span');
+    author.className = 'author';
+    author.style.color = colorFor(env.from);
+    author.textContent = env.from || '?';
+    const arrow = document.createElement('span');
+    arrow.className = 'arrow';
+    arrow.textContent = '→';
+    const toEl = document.createElement('span');
+    toEl.className = 'to';
+    toEl.style.color = colorFor(env.to);
+    toEl.textContent = env.to || '?';
+    const ts = document.createElement('span');
+    ts.className = 'ts';
+    ts.textContent = fmtTime(env.ts);
+    const idEl = document.createElement('span');
+    idEl.className = 'id';
+    idEl.textContent = shortId(env.id);
+    const badge = document.createElement('span');
+    badge.className = 'badge kind-' + (env.kind || 'unknown');
+    badge.textContent = env.kind || '?';
+    meta.appendChild(author);
+    meta.appendChild(arrow);
+    meta.appendChild(toEl);
+    meta.appendChild(ts);
+    meta.appendChild(idEl);
+    meta.appendChild(badge);
+    row.appendChild(meta);
+
+    const preview = document.createElement('div');
+    preview.className = 'body-preview';
+    preview.textContent = bodyToText(env.body);
+    const fade = document.createElement('div');
+    fade.className = 'fade';
+    preview.appendChild(fade);
+    preview.addEventListener('click', function () {
+      preview.classList.toggle('expanded');
+    });
+    row.appendChild(preview);
+    return row;
+  }
+
+  function isAtBottom() {
+    const slack = 16;
+    return feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - slack;
+  }
+
+  function appendEnvelope(env) {
+    if (!env || !env.id) return;
+    if (seen.has(env.id)) return;
+    seen.add(env.id);
+    ring.push(env);
+    if (env.from && env.kind === 'presence') {
+      presenceLast[env.from] = Date.now();
+    }
+    while (ring.length > RING_MAX) {
+      const dropped = ring.shift();
+      if (dropped && dropped.id) seen.delete(dropped.id);
+      if (feedEl.firstChild && feedEl.firstChild !== feedEmpty) {
+        feedEl.removeChild(feedEl.firstChild);
+      }
+    }
+    if (feedEmpty && feedEmpty.parentNode === feedEl) {
+      feedEl.removeChild(feedEmpty);
+    }
+    const wasBottom = isAtBottom();
+    feedEl.appendChild(makeRow(env));
+    if (wasBottom) feedEl.scrollTop = feedEl.scrollHeight;
+    if (minimized) {
+      unread++;
+      bubbleCount.textContent = String(unread);
+    }
+    // Fire native notification for incoming @zack envelopes.
+    maybeNotify(env);
+  }
+
+  function looksLikeEnvelope(o) {
+    return o && typeof o === 'object'
+      && typeof o.id === 'string'
+      && typeof o.from === 'string'
+      && typeof o.to === 'string'
+      && typeof o.kind === 'string'
+      && typeof o.ts === 'string';
+  }
+
+  function nowIso() { return new Date().toISOString(); }
+  function uuid() {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      const r = (Math.random() * 16) | 0;
+      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+    });
+  }
+
+  function buildEnvelope(toAddr, body, kind, room) {
+    const ts = nowIso();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    return {
+      id: uuid(),
+      from: cfg.jidAs,
+      to: toAddr,
+      room: room || cfg.room || '#main',
+      kind: kind || 'task',
+      body: body,
+      replyTo: null,
+      trace: uuid(),
+      seq: 0,
+      ts: ts,
+      expiresAt: expiresAt
+    };
+  }
+
+  async function healthCheck(url) {
+    const u = new URL(url);
+    const httpUrl = u.protocol + '//' + u.host + '/healthz';
+    const res = await fetch(httpUrl, { method: 'GET', cache: 'no-store' });
+    if (!res.ok) throw new Error('healthz HTTP ' + res.status);
+    return res.json().catch(function () { return {}; });
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  }
+
+  function scheduleReconnect() {
+    if (manualDisconnect) return;
+    clearReconnectTimer();
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    reconBanner.textContent = 'reconnecting in ' + Math.round(delay / 1000) + 's…';
+    reconBanner.classList.remove('hidden');
+    setConnDot('warn', 'reconnecting');
+    reconnectTimer = setTimeout(function () { connectWs(); }, delay);
+  }
+
+  function connectWs() {
+    if (!cfg) return;
+    clearReconnectTimer();
+    let url;
+    try {
+      url = buildWsUrl(cfg.workerUrl, cfg.room || '#main', cfg.jidAs, cfg.bearer);
+    } catch (e) {
+      setConnDot('err', 'invalid worker URL: ' + (e && e.message || e));
+      setHint('invalid worker URL', 'err');
+      return;
+    }
+    setConnDot('warn', 'connecting');
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setConnDot('err', 'WS construct failed: ' + (e && e.message || e));
+      scheduleReconnect();
+      return;
+    }
+    ws.addEventListener('open', function () {
+      reconnectAttempts = 0;
+      reconBanner.classList.add('hidden');
+      setConnDot('ok', 'connected to ' + connectedHostname);
+      setHint('connected', 'ok');
+      const joinEnv = buildEnvelope(cfg.room || '#main', { jid: cfg.jidAs }, 'join', cfg.room || '#main');
+      try { ws.send(JSON.stringify(joinEnv)); } catch (e) { /* ignore */ }
+    });
+    ws.addEventListener('message', function (ev) {
+      let raw = null;
+      try { raw = JSON.parse(ev.data); } catch (e) { return; }
+      if (!looksLikeEnvelope(raw)) return;
+      appendEnvelope(raw);
+    });
+    ws.addEventListener('error', function () {
+      setConnDot('err', 'WS error');
+    });
+    ws.addEventListener('close', function (ev) {
+      setConnDot('err', 'closed (' + ev.code + ')');
+      if (!manualDisconnect) scheduleReconnect();
+    });
+  }
+
+  function disconnectWs() {
+    manualDisconnect = true;
+    clearReconnectTimer();
+    if (ws) {
+      try { ws.close(); } catch (e) { /* ignore */ }
+      ws = null;
+    }
+    setConnDot('err', 'disconnected');
+    reconBanner.classList.add('hidden');
+  }
+
+  async function sendEnvelope(env) {
+    const u = new URL(cfg.workerUrl);
+    const httpUrl = u.protocol + '//' + u.host + '/send';
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + cfg.bearer
+      },
+      body: JSON.stringify(env)
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* ignore */ }
+    if (!res.ok) {
+      const msg = (data && (data.error || data.code)) || ('HTTP ' + res.status);
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  async function tryConnect(c) {
+    cfg = c;
+    await saveCfg(cfg);
+    manualDisconnect = false;
+    setView('connecting');
+    try {
+      const u = new URL(cfg.workerUrl);
+      connectedHostname = u.hostname;
+      connectingMsg.textContent = 'Connecting to ' + connectedHostname + '…';
+      await healthCheck(cfg.workerUrl);
+    } catch (e) {
+      cfgErr.style.display = 'block';
+      cfgErr.textContent = 'Health check failed: ' + (e && e.message || e);
+      setView('setup');
+      return;
+    }
+    cfgErr.style.display = 'none';
+    hostLabel.textContent = connectedHostname;
+    meJidLabel.textContent = cfg.jidAs;
+    targetPill.textContent = cfg.room || '#main';
+    setView('live');
+    connectWs();
+
+    // Pre-emptively request notification permission once we're live.
+    try {
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(function () {});
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function handleSend() {
+    const raw = composer.value;
+    const parsed = parseInput(raw, cfg.room || '#main');
+    if (parsed.kind === 'noop') return;
+    if (parsed.kind === 'error') { setHint(parsed.message, 'err'); return; }
+
+    if (parsed.kind === 'cmd') {
+      handleCommand(parsed);
+      composer.value = '';
+      return;
+    }
+
+    sendBtn.disabled = true;
+    try {
+      const env = buildEnvelope(parsed.to, parsed.body, parsed.sendKind || 'task', parsed.room);
+      await sendEnvelope(env);
+      appendEnvelope(env);
+      composer.value = '';
+      setHint('sent ' + shortId(env.id) + ' → ' + parsed.to, 'ok');
+    } catch (err) {
+      setHint('send failed: ' + (err && err.message || err), 'err');
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  function handleCommand(cmd) {
+    switch (cmd.name) {
+      case 'help':
+        helpOverlay.classList.add('open');
+        return;
+      case 'clear':
+        ring.length = 0; seen.clear();
+        feedEl.innerHTML = '';
+        feedEl.appendChild(feedEmpty);
+        setHint('feed cleared (bus untouched)');
+        return;
+      case 'who': {
+        const cutoff = Date.now() - 90 * 1000;
+        const live = Object.keys(presenceLast).filter(j => presenceLast[j] >= cutoff).sort();
+        if (live.length === 0) {
+          setHint('(no recent presence; waiting for kind:presence)');
+        } else {
+          setHint('peers (≤90s): ' + live.join(', '));
+        }
+        return;
+      }
+      case 'quit':
+        disconnectWs();
+        setHint('disconnected');
+        return;
+    }
+  }
+
+  // ─── Wire UI events ───────────────────────────────────────────────────────
+  cfgSave.addEventListener('click', async function () {
+    const url = (cfgUrl.value || '').trim();
+    const bearer = (cfgBearer.value || '').trim();
+    const jid = (cfgJid.value || '').trim();
+    const room = (cfgRoom.value || '').trim() || '#main';
+    if (!url) { cfgErr.style.display = 'block'; cfgErr.textContent = 'Worker URL required'; return; }
+    if (!bearer) { cfgErr.style.display = 'block'; cfgErr.textContent = 'Bearer required'; return; }
+    if (!jid || jid[0] !== '@') { cfgErr.style.display = 'block'; cfgErr.textContent = 'JID must start with @'; return; }
+    cfgErr.style.display = 'none';
+    await tryConnect({ workerUrl: url, bearer: bearer, jidAs: jid, room: room, soundOn: false });
+  });
+  cfgCancel.addEventListener('click', function () {
+    if (cfg) setView('live');
+  });
+  connectingCancel.addEventListener('click', function () {
+    manualDisconnect = true;
+    clearReconnectTimer();
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    setView('setup');
+  });
+
+  $('btn-gear').addEventListener('click', function () {
+    if (cfg) {
+      cfgUrl.value = cfg.workerUrl || '';
+      cfgBearer.value = cfg.bearer || '';
+      cfgJid.value = cfg.jidAs || '';
+      cfgRoom.value = cfg.room || '#main';
+    }
+    cfgCancel.style.display = 'inline-block';
+    setView('setup');
+  });
+
+  $('btn-min').addEventListener('click', function () {
+    // In desktop mode the OS window provides minimize. Hide the bubble UX
+    // for browser parity but ask the host to hide via window.coworkDesktop.
+    minimized = true;
+    if (window.coworkDesktop) {
+      // The Electron window-close handler hides instead of quitting; emulate
+      // that by closing — main.js intercepts. Use window.close() which works
+      // in Electron with safe-context.
+      try { window.close(); return; } catch (e) {}
+    }
+    widget.classList.add('hidden');
+    bubbleMin.classList.add('show');
+    unread = 0;
+    bubbleCount.textContent = '0';
+  });
+  bubbleMin.addEventListener('click', function () {
+    minimized = false;
+    bubbleMin.classList.remove('show');
+    widget.classList.remove('hidden');
+    unread = 0;
+    bubbleCount.textContent = '0';
+  });
+
+  $('help-close').addEventListener('click', function () {
+    helpOverlay.classList.remove('open');
+  });
+
+  composer.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      handleSend();
+    }
+  });
+  sendBtn.addEventListener('click', handleSend);
+
+  // ─── switchRoom: leave current room, persist, rejoin ─────────────────────
+  function switchRoom(roomName) {
+    if (!cfg || !roomName) return;
+    if (roomName === cfg.room) {
+      setHint('already in ' + roomName);
+      return;
+    }
+    cfg.room = roomName;
+    // saveCfg is async in desktop mode (safeStorage round-trip); fire-and-forget.
+    Promise.resolve(saveCfg(cfg)).catch(function () { /* ignore persist failure */ });
+    targetPill.textContent = roomName;
+    manualDisconnect = true;
+    clearReconnectTimer();
+    if (ws) {
+      try { ws.close(); } catch (e) { /* ignore */ }
+      ws = null;
+    }
+    manualDisconnect = false;
+    setHint('switching to ' + roomName + '…');
+    connectWs();
+  }
+
+  // ─── Ctrl+K command palette ──────────────────────────────────────────────
+  // Self-contained: candidate list, fuzzy ranking, frecency, presence cache.
+  const cmdkOverlay   = $('cmdk-overlay');
+  const cmdkSearchEl  = $('cmdk-search');
+  const cmdkListEl    = $('cmdk-list');
+  const CMDK_HIST_KEY = 'aether_splicer_cmdk_history';
+  const CMDK_HIST_MAX = 50;
+  let   cmdkOpen      = false;
+  let   cmdkItems     = [];
+  let   cmdkSelected  = 0;
+  let   presenceCache = null;     // { agents, rooms }
+  let   presenceCacheTs = 0;      // ms timestamp
+
+  function loadCmdkHistory() {
+    try {
+      const raw = localStorage.getItem(CMDK_HIST_KEY);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) { return {}; }
+  }
+  function saveCmdkHistory(hist) {
+    try {
+      const entries = Object.keys(hist).map(function (k) {
+        return [k, hist[k]];
+      });
+      entries.sort(function (a, b) {
+        return (b[1].lastUsed || 0) - (a[1].lastUsed || 0);
+      });
+      const trimmed = {};
+      for (let i = 0; i < Math.min(entries.length, CMDK_HIST_MAX); i++) {
+        trimmed[entries[i][0]] = entries[i][1];
+      }
+      localStorage.setItem(CMDK_HIST_KEY, JSON.stringify(trimmed));
+    } catch (e) { /* ignore */ }
+  }
+  function bumpCmdkHistory(itemId) {
+    const hist = loadCmdkHistory();
+    const cur = hist[itemId] || { count: 0, lastUsed: 0 };
+    cur.count = (cur.count || 0) + 1;
+    cur.lastUsed = Date.now();
+    hist[itemId] = cur;
+    saveCmdkHistory(hist);
+  }
+
+  // Char-subsequence fuzzy match. Returns { match: boolean, score: number }.
+  function cmdkFuzzy(query, label) {
+    if (!query) return { match: true, score: 0 };
+    const q = query.toLowerCase();
+    const s = String(label || '').toLowerCase();
+    let qi = 0, score = 0, prevIdx = -2;
+    for (let si = 0; si < s.length && qi < q.length; si++) {
+      if (s[si] === q[qi]) {
+        let bonus = 1;
+        if (si === 0) bonus += 10;
+        else {
+          const prev = s[si - 1];
+          if (prev === ' ' || prev === '-' || prev === '_' ||
+              prev === '/' || prev === '#' || prev === '@') {
+            bonus += 10;  // first-char-of-word
+          }
+        }
+        if (si === prevIdx + 1) bonus += 5; // consecutive
+        score += bonus;
+        prevIdx = si;
+        qi++;
+      }
+    }
+    if (qi < q.length) return { match: false, score: 0 };
+    return { match: true, score: score };
+  }
+
+  async function fetchPresenceFresh() {
+    if (!cfg || !cfg.workerUrl) return null;
+    const u = new URL(cfg.workerUrl);
+    const httpUrl = u.protocol + '//' + u.host + '/presence';
+    try {
+      const res = await fetch(httpUrl, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { 'Authorization': 'Bearer ' + (cfg.bearer || '') }
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data && typeof data === 'object') {
+        presenceCache = {
+          agents: data.agents || {},
+          rooms:  data.rooms  || {}
+        };
+        presenceCacheTs = Date.now();
+        return presenceCache;
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+
+  function maybeRefreshPresence() {
+    const stale = !presenceCache || (Date.now() - presenceCacheTs > 30000);
+    if (stale) {
+      fetchPresenceFresh().then(function (p) {
+        if (p && cmdkOpen) renderCmdkList();
+      }).catch(function () {});
+    }
+  }
+
+  function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed'; ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        ok ? resolve() : reject(new Error('execCommand copy failed'));
+      } catch (e) { reject(e); }
+    });
+  }
+
+  function buildCmdkCandidates() {
+    const items = [];
+    items.push({
+      id: 'cmd:help', glyph: '>', glyphClass: '',
+      label: '/help', secondary: 'Show splicer help',
+      run: function () { helpOverlay.classList.add('open'); }
+    });
+    items.push({
+      id: 'cmd:to', glyph: '>', glyphClass: '',
+      label: '/to @addr <body>', secondary: 'Send to specific peer',
+      run: function () { composer.value = '/to '; composer.focus(); }
+    });
+    items.push({
+      id: 'cmd:whisper', glyph: '>', glyphClass: '',
+      label: '/whisper @addr <body>', secondary: 'Direct in #whisper-* room',
+      run: function () { composer.value = '/whisper '; composer.focus(); }
+    });
+    items.push({
+      id: 'cmd:broadcast', glyph: '>', glyphClass: '',
+      label: '/broadcast <body>', secondary: 'Send with to:*',
+      run: function () { composer.value = '/broadcast '; composer.focus(); }
+    });
+    items.push({
+      id: 'cmd:who', glyph: '>', glyphClass: '',
+      label: '/who', secondary: 'Show recent peers',
+      run: function () { handleCommand({ name: 'who' }); }
+    });
+    items.push({
+      id: 'cmd:clear', glyph: '>', glyphClass: '',
+      label: '/clear', secondary: 'Clear local feed',
+      run: function () { handleCommand({ name: 'clear' }); }
+    });
+    items.push({
+      id: 'cmd:quit', glyph: '>', glyphClass: '',
+      label: '/quit', secondary: 'Disconnect WS',
+      run: function () { handleCommand({ name: 'quit' }); }
+    });
+
+    if (presenceCache) {
+      const agents = presenceCache.agents || {};
+      const peerKeys = Object.keys(agents).sort();
+      for (let i = 0; i < peerKeys.length; i++) {
+        const jid = peerKeys[i];
+        const a = agents[jid] || {};
+        const online = !!a.online;
+        const transport = (a.transport && typeof a.transport === 'string')
+          ? a.transport : '';
+        const dot = online ? '●' : '○';
+        const sec = (online ? 'online' : 'offline') +
+                    (transport ? (' · ' + transport) : '');
+        items.push({
+          id: 'peer:' + jid,
+          glyph: dot,
+          glyphClass: online ? 'peer-on' : 'peer-off',
+          label: jid,
+          secondary: sec,
+          run: (function (target) { return function () {
+            composer.value = '/to ' + target + ' ';
+            composer.focus();
+          }; })(jid)
+        });
+      }
+      const rooms = presenceCache.rooms || {};
+      const roomKeys = Object.keys(rooms).sort();
+      for (let j = 0; j < roomKeys.length; j++) {
+        const rname = roomKeys[j];
+        const r = rooms[rname] || {};
+        const memberCount = Array.isArray(r.members) ? r.members.length : 0;
+        items.push({
+          id: 'room:' + rname,
+          glyph: '#',
+          glyphClass: 'room',
+          label: rname,
+          secondary: memberCount ? (memberCount + ' members') : 'jump to room',
+          run: (function (target) { return function () {
+            switchRoom(target);
+          }; })(rname)
+        });
+      }
+    }
+
+    items.push({
+      id: 'act:health', glyph: '!', glyphClass: 'action',
+      label: 'Health check', secondary: 'GET /healthz on the Worker',
+      run: function () {
+        if (!cfg) { setHint('not connected', 'err'); return; }
+        setHint('checking…');
+        healthCheck(cfg.workerUrl).then(function (data) {
+          setHint('healthz ok' + (data && data.ts ? (' · ' + data.ts) : ''), 'ok');
+        }).catch(function (err) {
+          setHint('healthz failed: ' + (err && err.message || err), 'err');
+        });
+      }
+    });
+    items.push({
+      id: 'act:copy-presence', glyph: '!', glyphClass: 'action',
+      label: 'Copy presence URL', secondary: 'Copies <workerUrl>/presence',
+      run: function () {
+        if (!cfg) { setHint('not connected', 'err'); return; }
+        try {
+          const u = new URL(cfg.workerUrl);
+          const presenceUrl = u.protocol + '//' + u.host + '/presence';
+          copyToClipboard(presenceUrl).then(function () {
+            setHint('copied: ' + presenceUrl, 'ok');
+          }).catch(function (err) {
+            setHint('copy failed: ' + (err && err.message || err), 'err');
+          });
+        } catch (e) {
+          setHint('invalid worker URL', 'err');
+        }
+      }
+    });
+
+    return items;
+  }
+
+  function rankCmdkItems(query, candidates) {
+    const hist = loadCmdkHistory();
+    const q = String(query || '').trim();
+    const scored = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const it = candidates[i];
+      const haystack = it.label + ' ' + (it.secondary || '');
+      const r = cmdkFuzzy(q, haystack);
+      if (!r.match) continue;
+      const h = hist[it.id] || { count: 0, lastUsed: 0 };
+      const ageMs = Date.now() - (h.lastUsed || 0);
+      const recency = h.lastUsed ? Math.max(0, 30 - Math.floor(ageMs / 60000)) : 0;
+      const frecency = (h.count || 0) * 2 + recency;
+      scored.push({ item: it, score: r.score, frecency: frecency, idx: i });
+    }
+    if (q) {
+      scored.sort(function (a, b) {
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.frecency !== a.frecency) return b.frecency - a.frecency;
+        return a.idx - b.idx;
+      });
+    } else {
+      scored.sort(function (a, b) {
+        if (a.idx !== b.idx) return a.idx - b.idx;
+        return b.frecency - a.frecency;
+      });
+    }
+    return scored.map(function (s) { return s.item; });
+  }
+
+  function renderCmdkList() {
+    const q = cmdkSearchEl.value || '';
+    const candidates = buildCmdkCandidates();
+    cmdkItems = rankCmdkItems(q, candidates);
+    if (cmdkSelected >= cmdkItems.length) cmdkSelected = 0;
+    if (cmdkSelected < 0) cmdkSelected = 0;
+    cmdkListEl.innerHTML = '';
+    if (cmdkItems.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'cmdk-empty';
+      empty.textContent = 'No matches.';
+      cmdkListEl.appendChild(empty);
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < cmdkItems.length; i++) {
+      const it = cmdkItems[i];
+      const row = document.createElement('div');
+      row.className = 'cmdk-row' + (i === cmdkSelected ? ' active' : '');
+      row.dataset.idx = String(i);
+      const g = document.createElement('span');
+      g.className = 'cmdk-glyph' + (it.glyphClass ? (' ' + it.glyphClass) : '');
+      g.textContent = it.glyph || '·';
+      const l = document.createElement('span');
+      l.className = 'cmdk-label';
+      l.textContent = it.label || '';
+      row.appendChild(g);
+      row.appendChild(l);
+      if (it.secondary) {
+        const s = document.createElement('span');
+        s.className = 'cmdk-secondary';
+        s.textContent = it.secondary;
+        row.appendChild(s);
+      }
+      row.addEventListener('mouseenter', (function (idx) {
+        return function () {
+          cmdkSelected = idx;
+          updateCmdkActive();
+        };
+      })(i));
+      row.addEventListener('click', (function (idx) {
+        return function () {
+          cmdkSelected = idx;
+          activateCmdk();
+        };
+      })(i));
+      frag.appendChild(row);
+    }
+    cmdkListEl.appendChild(frag);
+    scrollCmdkActiveIntoView();
+  }
+
+  function updateCmdkActive() {
+    const rows = cmdkListEl.querySelectorAll('.cmdk-row');
+    for (let i = 0; i < rows.length; i++) {
+      if (i === cmdkSelected) rows[i].classList.add('active');
+      else rows[i].classList.remove('active');
+    }
+    scrollCmdkActiveIntoView();
+  }
+
+  function scrollCmdkActiveIntoView() {
+    const rows = cmdkListEl.querySelectorAll('.cmdk-row');
+    const el = rows[cmdkSelected];
+    if (el && el.scrollIntoView) {
+      el.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function openCmdk() {
+    cmdkOpen = true;
+    cmdkSearchEl.value = '';
+    cmdkSelected = 0;
+    cmdkOverlay.classList.add('open');
+    maybeRefreshPresence();
+    renderCmdkList();
+    setTimeout(function () {
+      try { cmdkSearchEl.focus(); cmdkSearchEl.select(); } catch (e) {}
+    }, 0);
+  }
+
+  function closeCmdk() {
+    cmdkOpen = false;
+    cmdkOverlay.classList.remove('open');
+  }
+
+  function activateCmdk() {
+    const it = cmdkItems[cmdkSelected];
+    if (!it) return;
+    bumpCmdkHistory(it.id);
+    closeCmdk();
+    try { it.run(); } catch (e) {
+      setHint('action failed: ' + (e && e.message || e), 'err');
+    }
+  }
+
+  cmdkSearchEl.addEventListener('input', function () {
+    cmdkSelected = 0;
+    renderCmdkList();
+  });
+  cmdkSearchEl.addEventListener('keydown', function (ev) {
+    if (ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      if (cmdkItems.length) {
+        cmdkSelected = (cmdkSelected + 1) % cmdkItems.length;
+        updateCmdkActive();
+      }
+    } else if (ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (cmdkItems.length) {
+        cmdkSelected = (cmdkSelected - 1 + cmdkItems.length) % cmdkItems.length;
+        updateCmdkActive();
+      }
+    } else if (ev.key === 'Enter') {
+      ev.preventDefault();
+      activateCmdk();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeCmdk();
+    }
+  });
+  cmdkOverlay.addEventListener('click', function (ev) {
+    if (ev.target === cmdkOverlay) closeCmdk();
+  });
+
+  // Global trigger: Ctrl+K / Cmd+K opens; Esc closes.
+  document.addEventListener('keydown', function (ev) {
+    const isModK = (ev.key === 'k' || ev.key === 'K') && (ev.ctrlKey || ev.metaKey);
+    if (isModK) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (cmdkOpen) closeCmdk(); else openCmdk();
+      return;
+    }
+    if (ev.key === 'Escape' && cmdkOpen) {
+      ev.preventDefault();
+      closeCmdk();
+    }
+  }, true);
+
+  // ─── Init ─────────────────────────────────────────────────────────────────
+  (async function init() {
+    const stored = await loadCfg();
+    if (stored && stored.workerUrl && stored.bearer && stored.jidAs) {
+      cfgUrl.value = stored.workerUrl;
+      cfgBearer.value = stored.bearer;
+      cfgJid.value = stored.jidAs;
+      cfgRoom.value = stored.room || '#main';
+      cfgCancel.style.display = 'inline-block';
+      tryConnect(stored);
+    } else {
+      cfgUrl.value = (stored && stored.workerUrl) || 'https://hub-relay.halkive.workers.dev';
+      cfgBearer.value = (stored && stored.bearer) || '';
+      cfgJid.value = (stored && stored.jidAs) || defaultJid();
+      cfgRoom.value = (stored && stored.room) || '#main';
+      cfgCancel.style.display = 'none';
+      setView('setup');
+    }
+  })();
+})();
+</script>
+</body>
+</html>

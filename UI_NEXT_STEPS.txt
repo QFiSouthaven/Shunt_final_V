@@ -1,0 +1,219 @@
+============================================================
+AETHER SHUNT — UI NEXT STEPS (saved 2026-05-10)
+============================================================
+
+The merge-and-fill is on disk. UI/ now contains a working
+Next.js 15 / React 19 admin shell built on its own security
+chassis. Two manual steps then it deploys.
+
+
+------------------------------------------------------------
+STEP 1 — DELETE THE DUPLICATE PAGE
+------------------------------------------------------------
+
+A sub-agent created C:\Users\Falki\shunt-final-v\UI\app\(authed)\page.tsx
+in error. It conflicts with C:\Users\Falki\shunt-final-v\UI\app\page.tsx
+because both resolve to the route "/" and Next.js refuses to
+build with two pages at the same path.
+
+I could not delete it from this session — neither the workspace
+shell nor the cowork delete tool were available. The fix is one
+double-click:
+
+    C:\Users\Falki\shunt-final-v\start\fix-ui-duplicate-route.bat
+
+That script runs a single `del` and pauses so you see the result.
+
+
+------------------------------------------------------------
+STEP 2 — INSTALL DEPS
+------------------------------------------------------------
+
+    cd C:\Users\Falki\shunt-final-v\UI
+    npm install
+
+Sub-agent 2 stripped @google/genai and firebase-tools out of
+package.json and added @cloudflare/next-on-pages + wrangler.
+Fresh install required.
+
+
+------------------------------------------------------------
+STEP 3 — LOCAL SMOKE TEST
+------------------------------------------------------------
+
+    cd C:\Users\Falki\shunt-final-v\UI
+    npm run dev
+
+Visit http://localhost:3000 — you should see the dashboard
+(overview tiles + send-envelope quick form + live transcript).
+Sidebar links: Dashboard, Peers, Rooms, Bridges, Transcript,
+DLQ, Admin, Settings.
+
+For local admin access (since SSO isn't wired):
+    set DEV_ADMIN_OVERRIDE=1
+    npm run dev
+
+Or set the cookie aether-jid=<one of HUB_ADMIN_JIDS> in your
+browser dev tools.
+
+
+------------------------------------------------------------
+STEP 4 — DEPLOY TO CLOUDFLARE PAGES
+------------------------------------------------------------
+
+Prereq: wrangler logged into the same Cloudflare account that
+hosts hub-relay.halkive.workers.dev.
+
+    cd C:\Users\Falki\shunt-final-v\UI
+    wrangler login                                  (one-time)
+
+Create three KV namespaces, copy the IDs:
+
+    wrangler kv:namespace create AUDIT_KV
+    wrangler kv:namespace create AUDIT_FAILURES_KV
+    wrangler kv:namespace create RATE_LIMIT_KV
+
+Paste the returned IDs into UI/wrangler.toml under the three
+[[kv_namespaces]] blocks.
+
+Set production env vars in the Pages dashboard (Project →
+Settings → Environment variables, Production scope):
+
+    HUB_API_SECRET     = <your bearer>
+    HUB_ADMIN_JIDS     = halkive@gmail.com,...      (comma list)
+    WORKER_URL         = https://hub-relay.halkive.workers.dev
+    PANEL_SERVER_URL   = http://localhost:7777      (only if you proxy stdout)
+    NODE_ENV           = production                 (auto-set by Pages)
+
+Build + deploy:
+
+    npm run pages:build
+    npm run pages:deploy
+
+
+------------------------------------------------------------
+WHAT GOT BUILT — FILE MANIFEST
+------------------------------------------------------------
+
+Sub-agent 1 (pages, components, API routes) — 25 new files,
+~1,800 lines:
+
+  Routes (10):
+    /                   app/page.tsx
+    /peers              app/(authed)/peers/page.tsx
+    /peers/[jid]        app/(authed)/peers/[jid]/page.tsx
+    /rooms              app/(authed)/rooms/page.tsx
+    /rooms/[room]/schema  app/(authed)/rooms/[room]/schema/page.tsx
+    /bridges            app/(authed)/bridges/page.tsx
+    /transcript         app/(authed)/transcript/page.tsx
+    /dlq                app/(authed)/dlq/page.tsx
+    /admin              app/(authed)/admin/page.tsx       (gated)
+    /settings           app/(authed)/settings/page.tsx
+    + app/(authed)/layout.tsx  (route-group layout w/ SidebarNav)
+
+  Components (15 new in app/components/):
+    SidebarNav, AppShell, OverviewTiles, SendEnvelopeForm,
+    PeerList, PeerEnvelopeStream, PeerDetail,
+    RoomList, RoomSchemaEditor,
+    DLQViewer, BridgeStatus, TranscriptView,
+    RotateSecretAction, EditAdminJidsAction,
+    ConnectionDiagnostics
+    (kept: LiveTranscript, TailStdoutViewer,
+           AdminAuditLogViewer, SelfBrickingWarningBanner)
+
+  API routes (9 new in app/api/):
+    bus/send/route.ts                  POST  Zod-validated
+    bus/presence/route.ts              GET
+    bus/peers/[jid]/route.ts           GET
+    bridges/route.ts                   GET
+    admin/dlq/list/route.ts            GET   admin-gated
+    admin/dlq/replay/route.ts          POST  admin + audit + rate-limit
+    admin/dlq/discard/route.ts         POST  admin + audit + rate-limit
+    admin/secret/rotate/route.ts       POST  admin + audit + 2-step
+    admin/jids/edit/route.ts           POST  admin + audit + 2-step
+
+Sub-agent 2 (security + deploy):
+    middleware.ts                      isAdmin=true REPLACED with
+                                       cookie/header → HUB_ADMIN_JIDS
+                                       allowlist; DEV_ADMIN_OVERRIDE
+                                       supported, ignored in prod.
+    package.json                       @google/genai + firebase-tools
+                                       REMOVED; renamed to
+                                       aether-shunt-hub-ui; added
+                                       pages:build / pages:deploy /
+                                       pages:dev / typecheck scripts;
+                                       added @cloudflare/next-on-pages
+                                       + wrangler devDeps.
+    next.config.ts                     CSP + HSTS + X-Content-Type-
+                                       Options + X-Frame-Options +
+                                       Referrer-Policy + Permissions-
+                                       Policy now applied via headers.
+    wrangler.toml                      NEW — Pages config + 3 KV
+                                       namespace placeholders.
+    .env.example                       Cleaned of AI Studio template
+                                       fields.
+    app/layout.tsx                     metadata.title now
+                                       "Aether Shunt Hub".
+    README.md                          Authentication + Deployment
+                                       sections appended.
+
+
+------------------------------------------------------------
+KNOWN STUBS — STILL TO WIRE (planned by Plan agents this turn)
+------------------------------------------------------------
+
+1. DLQ ENDPOINTS — Worker doesn't yet expose /dlq, /dlq/<id>/replay,
+   DELETE /dlq/<id>. The UI's admin/dlq/list / admin/dlq/replay /
+   admin/dlq/discard routes audit the intent but stub-respond.
+   Plan A in this turn covers the design.
+
+2. /api/bridges — panel-server.mjs doesn't yet expose /api/bridges.
+   The UI's bridges/route.ts falls back to a hardcoded list with
+   status: 'unknown'. Plan B covers panel-server endpoints + start/
+   stop wiring against orchestrator.mjs.
+
+3. AdminAuditLogViewer — still uses mock data. Plan C covers a
+   new GET /api/admin/audit reading AUDIT_KV via kv.list({prefix:'audit:'}).
+
+4. Task #17 (still pending from prior session) — real Zod schema
+   serialization for Type-Safe Rooms.
+
+
+------------------------------------------------------------
+SECURITY POSTURE — WHAT'S CORRECT
+------------------------------------------------------------
+
+- HUB_API_SECRET only ever lives server-side. workerFetch in
+  app/lib/worker-client.ts is 'server-only' and SSRF-guarded
+  (rejects "://" in path).
+- Client never opens a WebSocket directly to the Worker.
+  All real-time goes through SSE proxied at /api/bus/stream.
+- Every admin mutation goes through audit state-machine
+  (beginAudit → completeAudit | failAudit) and rate-limit.
+- 2-step confirmation required for rotate-secret and edit-jids.
+- CSP + HSTS + XCTO + XFO via next.config.ts.
+- Markdown rendering uses rehype-sanitize on every adversarial
+  input path.
+- middleware no longer hardcodes isAdmin=true. Admin lookup is
+  cookie-based with header override only outside production.
+
+
+------------------------------------------------------------
+WHEN YOU COME BACK
+------------------------------------------------------------
+
+If you hit a build error after running fix-ui-duplicate-route.bat
+and `npm install`, the most likely cause is a typescript strict
+issue in one of the new files. Run:
+
+    npm run typecheck
+
+It'll tell you the line. Ping me with the error.
+
+If pages:deploy fails with "binding not found", the KV IDs in
+wrangler.toml don't match what was created. Re-run
+`wrangler kv:namespace list` and paste the right IDs in.
+
+============================================================
+END
+============================================================

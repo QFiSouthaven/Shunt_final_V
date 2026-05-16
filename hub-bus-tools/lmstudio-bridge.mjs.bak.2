@@ -1,0 +1,568 @@
+#!/usr/bin/env node
+// lmstudio-bridge.mjs
+// Aether Shunt — LM Studio bus bridge daemon.
+//
+// Polls hub-bus/inbox/@lmstudio/ for envelopes addressed to @lmstudio,
+// forwards each one to the LM Studio chat-completions endpoint, and
+// writes the model's reply back onto the bus as a response envelope.
+//
+// Pure Node stdlib — no npm deps. Node 18+ (built-in fetch).
+
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  createEnvelope,
+  validateEnvelope,
+  writeEnvelopeToBus,
+  readInboxFor,
+} from './envelope.mjs';
+import {
+  claimEnvelope,
+  releaseEnvelope,
+  recoverOrphans,
+} from './claim.mjs';
+import { startHeartbeat } from './heartbeat.mjs';
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const LMSTUDIO_URL =
+  process.env.LMSTUDIO_URL || 'http://localhost:1234/v1/chat/completions';
+const LMSTUDIO_MODEL_ENV = process.env.LMSTUDIO_MODEL;
+const LEGACY_DEFAULT_MODEL = 'local-model';
+const LMSTUDIO_API_KEY = process.env.LMSTUDIO_API_KEY || '';
+// Wallclock timeout for a single /v1/chat/completions call. If LM Studio
+// hangs (large model, complex prompt, stuck inference), the bridge would
+// otherwise hold its single-flight inbox slot indefinitely and starve every
+// other envelope addressed to @lmstudio. AbortController fires at this
+// deadline; the per-envelope handler then releases the claim for retry so
+// the next bridge tick picks the envelope back up.
+export const LMSTUDIO_TIMEOUT_MS = Number(process.env.LMSTUDIO_TIMEOUT_MS) || 90_000;
+
+// Module-level cache: the active model name used in chat-completions POSTs.
+// Resolved on startup (see resolveModel) and re-resolved on demand if LM Studio
+// returns model_not_found mid-session.
+let RESOLVED_MODEL = LEGACY_DEFAULT_MODEL;
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 2000;
+const BUS_DIR =
+  process.env.BUS_DIR || 'C:\\Users\\Falki\\shunt-final-v\\hub-bus';
+const SYSTEM_PROMPT =
+  process.env.SYSTEM_PROMPT ||
+  'You are @lmstudio on the Aether Shunt bus. You are a local LLM peer alongside @claude and @gemini. Reply concisely and acknowledge who you are talking to. If asked to summarize, do so in <=4 sentences.';
+
+const ME = '@lmstudio';
+const INBOX_DIR = path.join(BUS_DIR, 'inbox', ME);
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+const log = (...args) => console.log('[lmstudio-bridge]', ...args);
+const errlog = (...args) => console.error('[lmstudio-bridge]', ...args);
+
+// ---------------------------------------------------------------------------
+// Daemon state
+// ---------------------------------------------------------------------------
+
+let stopping = false;
+let inFlight = 0;
+let processing = false; // single-flight tick guard
+let watcher = null;
+let pollTimer = null;
+let heartbeatHandle = null;
+
+// IDs we've already enqueued/processed in this run, to avoid double-handling
+// when fs.watch fires multiple times for the same file.
+const seenIds = new Set();
+
+// Per-envelope retry counter. Crashes/restarts reset this (good — paired
+// with .processing/ orphan recovery, the worst case is N=3 retries per fresh
+// claim, never an infinite loop across processes).
+const retryCounts = new Map();
+const MAX_RETRIES = 3;
+// Transient subprocess/network errors that should release as 'retry'.
+// Anything else (validation, EMPTY_RESPONSE, HTTP_4xx other than 429) ->
+// 'failed' so it lands in @dlq.
+const TRANSIENT_CODES = new Set([
+  'TIMEOUT',
+  'HTTP_429',
+  'HTTP_500',
+  'HTTP_502',
+  'HTTP_503',
+  'HTTP_504',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
+function isTransient(err) {
+  if (!err) return false;
+  const code = err.code || err.errno || '';
+  if (TRANSIENT_CODES.has(code)) return true;
+  // Some HTTP_5xx codes vary; treat any HTTP_5xx as transient.
+  if (typeof code === 'string' && /^HTTP_5\d\d$/.test(code)) return true;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Model resolution
+// ---------------------------------------------------------------------------
+
+// Build the /v1/models URL from the configured chat-completions URL.
+function modelsUrlFromChatUrl(chatUrl) {
+  // Strip a trailing /v1/chat/completions if present, then append /v1/models.
+  // Falls back to a sane default if the URL doesn't match the expected shape.
+  const base = chatUrl.replace(/\/v1\/chat\/completions\/?$/, '');
+  return `${base}/v1/models`;
+}
+
+// Auto-resolve the model name from LM Studio's /v1/models endpoint.
+// Returns the resolved name (string). Never throws — on failure, logs a WARN
+// and returns the legacy 'local-model' fallback so the bridge stays up.
+export async function resolveModel({ envValue = LMSTUDIO_MODEL_ENV, chatUrl = LMSTUDIO_URL, fetchImpl = globalThis.fetch } = {}) {
+  // Env override path: any non-empty value other than the legacy placeholder
+  // wins without a network call.
+  if (envValue && envValue !== LEGACY_DEFAULT_MODEL) {
+    log(`resolved model: ${envValue} (from env)`);
+    return envValue;
+  }
+
+  const url = modelsUrlFromChatUrl(chatUrl);
+  try {
+    const res = await fetchImpl(url);
+    if (!res || !res.ok) {
+      const status = res ? res.status : 'no-response';
+      throw new Error(`HTTP ${status}`);
+    }
+    const data = await res.json();
+    const first = Array.isArray(data?.data) ? data.data[0] : null;
+    const id = first && typeof first.id === 'string' ? first.id : null;
+    if (!id) {
+      throw new Error('no model id in /v1/models response');
+    }
+    log(`resolved model: ${id} (from /v1/models)`);
+    return id;
+  } catch (e) {
+    errlog(
+      `WARN: failed to auto-resolve model from /v1/models, using fallback "${LEGACY_DEFAULT_MODEL}" — set LMSTUDIO_MODEL env var to override (cause: ${e?.message || e})`,
+    );
+    return LEGACY_DEFAULT_MODEL;
+  }
+}
+
+// Inspect a non-OK chat-completion response. If it's an HTTP 400 with
+// error.code === 'model_not_found', refetch /v1/models and update
+// RESOLVED_MODEL. Returns true if a re-resolve happened. Caller does NOT retry
+// the current envelope — the orchestrator's normal retry path picks it up.
+export async function maybeReresolveOnModelNotFound(status, parsedBody, fetchImpl = globalThis.fetch) {
+  if (status !== 400) return false;
+  const code = parsedBody?.error?.code;
+  if (code !== 'model_not_found') return false;
+  errlog(
+    `WARN: LM Studio reported model_not_found for "${RESOLVED_MODEL}"; refetching /v1/models`,
+  );
+  // Force a /v1/models fetch by passing an empty envValue so the env-override
+  // path is skipped.
+  const next = await resolveModel({ envValue: '', fetchImpl });
+  RESOLVED_MODEL = next;
+  return true;
+}
+
+// Test-only: read/write RESOLVED_MODEL from outside this module.
+export function _getResolvedModel() {
+  return RESOLVED_MODEL;
+}
+export function _setResolvedModel(v) {
+  RESOLVED_MODEL = v;
+}
+
+// ---------------------------------------------------------------------------
+// LM Studio request
+// ---------------------------------------------------------------------------
+
+export async function callLmStudio(userBody, { fetchImpl = globalThis.fetch, timeoutMs = LMSTUDIO_TIMEOUT_MS } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (LMSTUDIO_API_KEY) headers['Authorization'] = `Bearer ${LMSTUDIO_API_KEY}`;
+
+  // Envelope body may be a string or an object — the LLM expects text.
+  const userContent =
+    typeof userBody === 'string' ? userBody : JSON.stringify(userBody, null, 2);
+
+  const payload = {
+    model: RESOLVED_MODEL,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: userContent },
+    ],
+    temperature: 0.7,
+    stream: false,
+  };
+
+  // Wallclock guard. Without this, a wedged LM Studio (large model still
+  // loading, inference stuck) would hold the bridge's single-flight inbox
+  // slot for as long as the TCP connection stayed open — minutes, sometimes
+  // forever. AbortController forces the underlying fetch to reject with
+  // AbortError after timeoutMs; the caller in handleEnvelope catches it and
+  // releases the envelope claim with status 'retry' so another tick can
+  // re-process it (or DLQ it after MAX_RETRIES via existing retry logic).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res;
+  try {
+    res = await fetchImpl(LMSTUDIO_URL, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    // On HTTP 400 with model_not_found, refresh RESOLVED_MODEL so the next
+    // envelope (orchestrator retry) picks up the right name.
+    if (res.status === 400) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {}
+      try {
+        await maybeReresolveOnModelNotFound(400, parsed);
+      } catch (e) {
+        errlog('re-resolve attempt failed:', e?.message || e);
+      }
+    }
+    const err = new Error(
+      `LM Studio HTTP ${res.status} ${res.statusText}: ${text.slice(0, 500)}`,
+    );
+    err.code = `HTTP_${res.status}`;
+    throw err;
+  }
+
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || content.length === 0) {
+    const err = new Error('LM Studio returned no message content');
+    err.code = 'EMPTY_RESPONSE';
+    throw err;
+  }
+  return content;
+}
+
+// ---------------------------------------------------------------------------
+// Envelope handling
+// ---------------------------------------------------------------------------
+
+async function handleEnvelope(entry) {
+  // entry shape from readInboxFor: envelope object with __path attached.
+  const envelope = entry?.envelope || entry?.data || entry;
+  const filePath =
+    entry?.path || entry?.filePath || entry?.file || entry?.__path;
+
+  if (!envelope || typeof envelope !== 'object') {
+    errlog('skipping malformed entry (no envelope object):', entry);
+    return;
+  }
+  if (!filePath) {
+    errlog('skipping entry with no path attached');
+    return;
+  }
+
+  // Atomic claim. If another bridge instance won the rename, bail silently.
+  const { claimed, newPath } = await claimEnvelope(filePath, ME);
+  if (!claimed) {
+    return;
+  }
+
+  // Validation comes after the claim so a malformed envelope still gets moved
+  // out of inbox/ (to @dlq) instead of being re-read on every poll.
+  try {
+    if (typeof validateEnvelope === 'function') {
+      validateEnvelope(envelope);
+    }
+  } catch (e) {
+    errlog('envelope failed validation:', e?.message || e);
+    await sendErrorReply(envelope, 'INVALID_ENVELOPE', String(e?.message || e));
+    try {
+      await releaseEnvelope(newPath, 'failed');
+    } catch (e2) {
+      errlog('releaseEnvelope(failed) failed:', e2?.message || e2);
+    }
+    return;
+  }
+
+  // ⚠ Kind filter at intake. These bridges are request-handlers only; if we
+  // processed kind=response/error/event/etc., another bridge's reply would
+  // be re-sent to LM Studio as a new work-item, fail, emit an error reply,
+  // and ping-pong forever. Drop non-request kinds and release the file as
+  // 'done' so it moves out of inbox/. Uniform across all four bridges (audit
+  // 2026-05-13: claude/gemini/lmstudio/adam all lacked this guard).
+  if (envelope.kind !== 'request') {
+    try {
+      await releaseEnvelope(newPath, 'done');
+    } catch {}
+    return;
+  }
+
+  const id = envelope.id || '<no-id>';
+  if (seenIds.has(id)) {
+    // Defensive: shouldn't happen now that claim is the gate, but keep the
+    // guard so a re-delivery (orphan recovery) doesn't double-process within
+    // the same process lifetime without going through the retry counter.
+    try {
+      await releaseEnvelope(newPath, 'done');
+    } catch {}
+    return;
+  }
+  seenIds.add(id);
+
+  log(
+    `arrival id=${id} from=${envelope.from} kind=${envelope.kind} room=${envelope.room || '#main'}`,
+  );
+
+  inFlight++;
+  const started = Date.now();
+  let releaseStatus = 'done';
+  try {
+    log(`request id=${id} -> ${LMSTUDIO_URL} model=${RESOLVED_MODEL}`);
+    const replyText = await callLmStudio(envelope.body);
+    const latency = Date.now() - started;
+    log(`response id=${id} latency=${latency}ms chars=${replyText.length}`);
+
+    const reply = await createEnvelope({
+      from: ME,
+      to: envelope.from,
+      kind: 'response',
+      replyTo: envelope.id,
+      trace: envelope.trace,
+      room: envelope.room,
+      body: replyText,
+      busDir: BUS_DIR,
+    });
+
+    await writeEnvelopeToBus(reply, BUS_DIR);
+    log(`reply sent id=${reply.id} replyTo=${envelope.id} to=${envelope.from}`);
+    retryCounts.delete(id);
+  } catch (e) {
+    const latency = Date.now() - started;
+    // AbortError -> wallclock timeout. Tag it so the existing transient/
+    // retry path treats it like any other recoverable error: increment
+    // counter, release for retry, DLQ after MAX_RETRIES.
+    if (e && e.name === 'AbortError') {
+      errlog(
+        `WARN: envelope ${id} exceeded ${LMSTUDIO_TIMEOUT_MS}ms — releasing for retry`,
+      );
+      e.code = 'TIMEOUT';
+    }
+    errlog(
+      `error id=${id} latency=${latency}ms code=${e?.code || 'ERR'} msg=${e?.message || e}`,
+    );
+    if (isTransient(e)) {
+      const next = (retryCounts.get(id) || 0) + 1;
+      if (next <= MAX_RETRIES) {
+        retryCounts.set(id, next);
+        log(`transient error id=${id}; retry ${next}/${MAX_RETRIES}`);
+        releaseStatus = 'retry';
+        // Allow re-claim on next tick.
+        seenIds.delete(id);
+      } else {
+        errlog(`exhausted retries id=${id}; dlq`);
+        retryCounts.delete(id);
+        releaseStatus = 'failed';
+        await sendErrorReply(envelope, e?.code || 'BRIDGE_ERROR', String(e?.message || e));
+      }
+    } else {
+      retryCounts.delete(id);
+      releaseStatus = 'failed';
+      await sendErrorReply(envelope, e?.code || 'BRIDGE_ERROR', String(e?.message || e));
+    }
+  } finally {
+    inFlight--;
+    try {
+      await releaseEnvelope(newPath, releaseStatus);
+    } catch (e) {
+      errlog(`releaseEnvelope(${releaseStatus}) failed for ${newPath}:`, e?.message || e);
+    }
+  }
+}
+
+async function sendErrorReply(originalEnvelope, code, message) {
+  try {
+    const errEnv = await createEnvelope({
+      from: ME,
+      to: originalEnvelope?.from || '@zack',
+      kind: 'error',
+      replyTo: originalEnvelope?.id || null,
+      trace: originalEnvelope?.trace,
+      room: originalEnvelope?.room,
+      body: { code, message },
+      busDir: BUS_DIR,
+    });
+    await writeEnvelopeToBus(errEnv, BUS_DIR);
+    log(`error envelope sent id=${errEnv.id} code=${code}`);
+  } catch (e) {
+    errlog('failed to send error envelope:', e?.message || e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Polling loop
+// ---------------------------------------------------------------------------
+
+async function tick() {
+  if (stopping || processing) return;
+  processing = true;
+  try {
+    const list = await readInboxFor(ME, BUS_DIR);
+    if (!Array.isArray(list) || list.length === 0) return;
+    for (const entry of list) {
+      if (stopping) break;
+      await handleEnvelope(entry);
+    }
+  } catch (e) {
+    errlog('tick failed:', e?.message || e);
+  } finally {
+    processing = false;
+  }
+}
+
+function startWatching() {
+  // Make sure the inbox dir exists so fs.watch doesn't throw.
+  try {
+    fs.mkdirSync(INBOX_DIR, { recursive: true });
+  } catch (e) {
+    errlog(`failed to ensure inbox dir ${INBOX_DIR}:`, e?.message || e);
+  }
+
+  // Always run the interval poller as a baseline.
+  pollTimer = setInterval(() => {
+    tick().catch((e) => errlog('tick error:', e?.message || e));
+  }, POLL_INTERVAL_MS);
+
+  // Best-effort fs.watch to wake up immediately on new files.
+  try {
+    watcher = fs.watch(INBOX_DIR, { persistent: true }, (eventType, name) => {
+      if (stopping) return;
+      if (!name) return;
+      if (!name.endsWith('.json')) return;
+      // debounce-by-tick: just kick a tick; tick() is single-flight.
+      tick().catch((e) => errlog('watch->tick error:', e?.message || e));
+    });
+    watcher.on('error', (e) => {
+      errlog('fs.watch error (continuing on interval poll):', e?.message || e);
+    });
+    log(`watching ${INBOX_DIR} (fs.watch active, poll=${POLL_INTERVAL_MS}ms)`);
+  } catch (e) {
+    errlog(
+      `fs.watch unavailable, falling back to interval-only (${POLL_INTERVAL_MS}ms):`,
+      e?.message || e,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  log(`received ${signal}, shutting down…`);
+  try {
+    if (pollTimer) clearInterval(pollTimer);
+  } catch {}
+  try {
+    if (watcher) watcher.close();
+  } catch {}
+  try {
+    if (heartbeatHandle) heartbeatHandle.stop();
+  } catch {}
+
+  const deadline = Date.now() + 30_000;
+  const waitForInflight = () => {
+    if (inFlight <= 0 || Date.now() >= deadline) {
+      log('shutdown complete.');
+      process.exit(0);
+      return;
+    }
+    setTimeout(waitForInflight, 100);
+  };
+  waitForInflight();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('uncaughtException', (e) => {
+  errlog('uncaughtException:', e?.stack || e?.message || e);
+});
+process.on('unhandledRejection', (e) => {
+  errlog('unhandledRejection:', e?.stack || e?.message || e);
+});
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+// Detect whether this module is the entry point. When imported (e.g. by unit
+// tests), skip the boot block so resolveModel/etc. can be exercised without
+// kicking off the poll loop, heartbeat, and orphan recovery.
+const __isMainEntry = (() => {
+  try {
+    const entry = process.argv?.[1];
+    if (!entry) return false;
+    // Normalize: forward slashes, strip the leading slash that file:// URLs
+    // emit before a Windows drive letter, lowercase.
+    const norm = (p) =>
+      String(p).replace(/\\/g, '/').replace(/^\/+([A-Za-z]:)/, '$1').toLowerCase();
+    const here = norm(new URL(import.meta.url).pathname);
+    const argv = norm(entry);
+    return here === argv || here.endsWith('/' + argv.split('/').pop());
+  } catch {
+    return false;
+  }
+})();
+
+if (__isMainEntry) {
+  log(`starting as ${ME} (claim/release/heartbeat enabled)`);
+  log(`bus dir: ${BUS_DIR}`);
+  log(`endpoint: ${LMSTUDIO_URL}`);
+  log(`poll interval: ${POLL_INTERVAL_MS}ms`);
+  log(`wallclock timeout: ${LMSTUDIO_TIMEOUT_MS}ms`);
+  log(`api key: ${LMSTUDIO_API_KEY ? 'set' : 'unset'}`);
+
+  // Resolve the active model name BEFORE the poll loop starts. resolveModel
+  // itself logs the resolved name (and source). On any failure it returns the
+  // legacy 'local-model' fallback with a WARN — bridge keeps running.
+  RESOLVED_MODEL = await resolveModel();
+
+  // Recover orphans from any prior bridge that crashed mid-process before we
+  // start consuming. Best-effort: log and continue if it throws.
+  try {
+    const recovered = await recoverOrphans(ME, BUS_DIR);
+    log(`orphan recovery: ${recovered} envelope(s) returned to inbox`);
+  } catch (e) {
+    errlog('orphan recovery failed:', e?.message || e);
+  }
+
+  // Begin presence heartbeat. Every 30s, stamp lastSeenAt in presence.json so
+  // observers can tell a live bridge from a dead one.
+  try {
+    heartbeatHandle = startHeartbeat(ME, BUS_DIR, 30000);
+    log('heartbeat started (30s interval)');
+  } catch (e) {
+    errlog('heartbeat start failed (continuing without):', e?.message || e);
+  }
+
+  startWatching();
+  // Run an immediate tick so any backlog is processed on boot.
+  tick().catch((e) => errlog('initial tick error:', e?.message || e));
+}

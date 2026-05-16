@@ -1,0 +1,70 @@
+# secret: HUB_API_SECRET set via 'npx wrangler secret put HUB_API_SECRET'
+## Aether Shunt — hub-relay Worker config.
+## Account: 1e28c63e2fd1a82751bd3b9af105f10f (Runing Runway).
+## Migrated from c6e9f3ff... (Halkice@yahoo.com) on 2026-05-08.
+## Locked decision §14: Durable Object per room as central routing boundary.
+##
+## NOTE: KV namespace and D1 database below need to be RECREATED on the new
+## account. The previous IDs (80e03b13... and d0466d8d...) belong to the old
+## account and will fail at deploy. See README.md "account migration".
+
+name = "hub-relay"
+main = "src/worker.ts"
+compatibility_date = "2026-05-08"
+compatibility_flags = ["nodejs_compat"]
+account_id = "1e28c63e2fd1a82751bd3b9af105f10f"
+
+# v0.2 auth stop-gap (P0 audit findings 1.1, 1.2, 4.4).
+# Plain (non-secret) variables. HUB_ADMIN_JIDS is the admin allowlist consulted
+# by `PUT /room/:room/schema` and by `kind:'schema-update'` envelopes in the DO.
+# Comma-separated, JIDs are trimmed. zack is the only admin by default.
+# The shared bearer secret HUB_API_SECRET is a Worker Secret (NOT here);
+# set it with `npx wrangler secret put HUB_API_SECRET`.
+[vars]
+HUB_ADMIN_JIDS = "@zack"
+
+# Durable Object class HubRoom — one DO instance per #room name.
+# Locked decision §14: idFromName(roomName) for sharding; native WS hibernation.
+[[durable_objects.bindings]]
+name = "HUB_ROOM"
+class_name = "HubRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["HubRoom"]
+
+# KV: presence / capability registry. JID -> { caps[], joinedAt, lastSeenAt }.
+# Eventual consistency is fine for presence (Blueprint §13).
+# Old (Halkice) namespace was 80e03b130d8a4535a4c10e8f9de76390 — abandoned with the account migration.
+# Create on Runing Runway via:
+#   npx wrangler kv:namespace create HUB_PRESENCE
+# Paste the new id below.
+[[kv_namespaces]]
+binding = "HUB_PRESENCE"
+id = "6db26994bcfd4f6a9f496cf19d8232ba"  # Runing Runway HUB_PRESENCE, created 2026-05-08
+
+# D1: append-only transcript log per room (Blueprint §13, §14 schema fields).
+# Old (Halkice) database was d0466d8d-8c02-4497-90db-7d0c4e7ced24 (region ENAM)
+# with migrations 0001/0002/0003 already applied — abandoned with account migration.
+# Create on Runing Runway via:
+#   npx wrangler d1 create hub_transcripts
+#   npx wrangler d1 execute hub_transcripts --remote --file=./migrations/0001_init.sql
+#   npx wrangler d1 execute hub_transcripts --remote --file=./migrations/0002_room_schemas.sql
+#   npx wrangler d1 execute hub_transcripts --remote --file=./migrations/0003_envelope_metadata.sql
+# Paste the new database_id below.
+[[d1_databases]]
+binding = "HUB_TRANSCRIPTS"
+database_name = "hub_transcripts"
+database_id = "a87829d1-4d7a-4e4b-b6e7-85fda56286cd"  # Runing Runway hub_transcripts, created 2026-05-08
+
+# R2: file deliveries / large body blobs.
+# DISABLED for v0.2 deploy. Worker code does not reference env.HUB_DELIVERIES yet
+# (it's only declared in src/types.ts for the future v0.3 deliver-kind handler).
+# To re-enable on Runing Runway: visit
+#   https://dash.cloudflare.com/1e28c63e2fd1a82751bd3b9af105f10f/r2
+# click Enable R2, then uncomment the block below and run:
+#   npx wrangler r2 bucket create hub-deliveries
+#   npx wrangler deploy
+#[[r2_buckets]]
+#binding = "HUB_DELIVERIES"
+#bucket_name = "hub-deliveries"

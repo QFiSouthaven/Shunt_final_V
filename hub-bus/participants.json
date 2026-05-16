@@ -1,0 +1,29 @@
+{
+  "external_peers": [
+    {
+      "enabled": true,
+      "jid": "@claude"
+    },
+    {
+      "enabled": true,
+      "jid": "@gemini"
+    },
+    {
+      "enabled": false,
+      "jid": "@ollama"
+    },
+    {
+      "enabled": false,
+      "jid": "@anythingllm"
+    }
+  ],
+  "lm_studio_slots": [
+    {
+      "model": "qwen3-coder-next",
+      "jid": "@lmstudio-1",
+      "enabled": true
+    }
+  ],
+  "version": 1,
+  "updated_at": "2026-05-14T23:16:20.834Z"
+}

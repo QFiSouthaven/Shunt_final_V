@@ -1,0 +1,472 @@
+#!/usr/bin/env node
+// hub-bus-tools/aggregator.mjs
+//
+// Pattern Z aggregator. Three responsibilities:
+//   1. /dispatch        — HTTP POST from the SPA. Fan-out to N peers via
+//                         the file-bus, collect replies, apply strategy,
+//                         return synthesized joint output.
+//   2. /participants    — GET / PUT. Owns hub-bus/participants.json, the
+//                         runtime LLM-pool config. PUT reconciles bridges
+//                         via the orchestrator's HTTP admin face.
+//   3. /lmstudio-models — GET proxy to LM Studio's /v1/models so the SPA
+//                         can populate model dropdowns without hitting LM
+//                         Studio's CORS policy directly.
+//
+// Plus /healthz for liveness.
+//
+// Runs as a child of orchestrator.mjs. Loopback-only HTTP bind (127.0.0.1).
+// Per the build plan's standing rails, if this binding moves off loopback
+// in the future, bearer auth must be added FIRST.
+//
+// Reply collection is kind-agnostic — matches by replyTo. Bus convention
+// is kind:request → kind:response (the plan narrative occasionally says
+// kind:reply; that's documentation drift, not a runtime concern).
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+
+import {
+  createEnvelope,
+  writeEnvelopeToBus,
+  readInboxFor,
+} from './envelope.mjs';
+import { releaseEnvelope } from './claim.mjs';
+
+// ─── Constants ────────────────────────────────────────────────────────
+
+const ME = '@aggregator';
+const PORT = Number(process.env.AGGREGATOR_PORT) || 7780;
+const HOST = process.env.AGGREGATOR_HOST || '127.0.0.1';
+const ORCH_ADMIN_URL = process.env.ORCH_ADMIN_URL || 'http://127.0.0.1:7779';
+const LMSTUDIO_BASE_URL = process.env.LMSTUDIO_BASE_URL || 'http://localhost:1234';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..');
+const HUB_BUS_DIR = path.join(REPO_ROOT, 'hub-bus');
+const PARTICIPANTS_PATH = path.join(HUB_BUS_DIR, 'participants.json');
+const LMS_INSTANCES_PATH = path.join(__dirname, 'lms-instances.json');
+
+const DEFAULT_DISPATCH_TIMEOUT_MS = 30_000;
+const DISPATCH_POLL_INTERVAL_MS = 500;
+const SYNTHESIZER_TIMEOUT_MS = 60_000;
+
+// ─── participants.json — read / seed / write ──────────────────────────
+
+async function readParticipants() {
+  try {
+    const raw = await fs.promises.readFile(PARTICIPANTS_PATH, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    const seed = await seedParticipants();
+    await writeParticipants(seed);
+    return seed;
+  }
+}
+
+async function seedParticipants() {
+  let slots = [{ jid: '@lmstudio-1', model: null, enabled: true }];
+  try {
+    const raw = await fs.promises.readFile(LMS_INSTANCES_PATH, 'utf8');
+    const cfg = JSON.parse(raw);
+    if (Array.isArray(cfg.slots) && cfg.slots.length > 0) {
+      slots = cfg.slots.map((s) => ({
+        jid: s.jid,
+        model: s.model || null,
+        enabled: s.enabled !== false,
+      }));
+    }
+  } catch {
+    /* leave default */
+  }
+  return {
+    version: 1,
+    updated_at: new Date().toISOString(),
+    updated_by: '@aggregator-boot',
+    lm_studio_slots: slots,
+    external_peers: [
+      { jid: '@claude', enabled: true },
+      { jid: '@gemini', enabled: true },
+      { jid: '@ollama', enabled: false },
+      { jid: '@anythingllm', enabled: false },
+    ],
+  };
+}
+
+async function writeParticipants(config) {
+  config.updated_at = new Date().toISOString();
+  const tmp = PARTICIPANTS_PATH + '.tmp';
+  await fs.promises.writeFile(tmp, JSON.stringify(config, null, 2), 'utf8');
+  await fs.promises.rename(tmp, PARTICIPANTS_PATH);
+}
+
+// ─── reconcileBridges — sync orchestrator state to participants ───────
+
+const PEER_TO_BRIDGE = {
+  '@claude': 'claude-bridge',
+  '@gemini': 'gemini-bridge',
+  '@ollama': 'ollama-bridge',
+  '@anythingllm': 'anythingllm-bridge',
+};
+
+async function orchPost(url) {
+  try {
+    const res = await fetch(url, { method: 'POST' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Pattern Z Phase 4.5 envprop-fix: POST with a JSON body so the orchestrator
+// can merge { envOverride: {...} } into the supervisor's spec.envOverride
+// PERSISTENTLY before the action. Used for lmstudio-bridge model swaps —
+// without this, the bridge respawns with its boot-time env (no LMSTUDIO_MODEL)
+// and auto-resolves to whatever LM Studio returns first, ignoring the UI
+// selection.
+async function orchPostJson(url, body) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function reconcileBridges(newConfig) {
+  // LM Studio slots — each slot maps to lmstudio-bridge-<slotName>.
+  // When enabled with a model: restart with envOverride pushing the
+  // model selection. When disabled OR model unset: stop.
+  for (const slot of newConfig.lm_studio_slots ?? []) {
+    const slotName = slot.jid
+      .replace('@lmstudio-', '')
+      .replace('@lmstudio', 'default')
+      .replace('@', '');
+    const bridgeName = `lmstudio-bridge-${slotName}`;
+    if (slot.enabled && slot.model) {
+      await orchPostJson(
+        `${ORCH_ADMIN_URL}/restart/${encodeURIComponent(bridgeName)}`,
+        { envOverride: { LMSTUDIO_MODEL: slot.model } },
+      );
+    } else {
+      await orchPost(`${ORCH_ADMIN_URL}/stop/${encodeURIComponent(bridgeName)}`);
+    }
+  }
+  // External peers — single-instance bridges, toggle start/stop.
+  // No env to push; the bridges' configs are stable at boot.
+  for (const peer of newConfig.external_peers ?? []) {
+    const bridgeName = PEER_TO_BRIDGE[peer.jid];
+    if (!bridgeName) continue;
+    if (peer.enabled) {
+      await orchPost(`${ORCH_ADMIN_URL}/start/${bridgeName}`);
+    } else {
+      await orchPost(`${ORCH_ADMIN_URL}/stop/${bridgeName}`);
+    }
+  }
+}
+
+// ─── dispatch — fan-out, collect, synthesize ──────────────────────────
+
+function activePeersFrom(config) {
+  const lms = (config.lm_studio_slots ?? [])
+    .filter((s) => s.enabled && s.model)
+    .map((s) => s.jid);
+  const ext = (config.external_peers ?? [])
+    .filter((p) => p.enabled)
+    .map((p) => p.jid);
+  return [...lms, ...ext];
+}
+
+async function dispatch({ intent, prompt, fanout_jids, strategy, timeout_ms }) {
+  const config = await readParticipants();
+  const peers = Array.isArray(fanout_jids) && fanout_jids.length > 0
+    ? fanout_jids
+    : activePeersFrom(config);
+
+  if (peers.length === 0) {
+    throw new Error('No active participants. Enable peers in Settings.');
+  }
+
+  const trace = randomUUID();
+  const requestIds = [];
+
+  for (const peer of peers) {
+    const env = await createEnvelope({
+      from: ME,
+      to: peer,
+      kind: 'request',
+      intent,
+      body: prompt,
+      room: `#fanout-${trace}`,
+      trace,
+    });
+    await writeEnvelopeToBus(env, HUB_BUS_DIR);
+    requestIds.push(env.id);
+  }
+
+  // Poll our inbox until N replies or timeout.
+  const deadline = Date.now() + (timeout_ms || DEFAULT_DISPATCH_TIMEOUT_MS);
+  const replies = new Map(); // peer -> reply text
+
+  while (Date.now() < deadline && replies.size < peers.length) {
+    const inbox = await readInboxFor(ME, HUB_BUS_DIR);
+    for (const entry of inbox) {
+      const env = entry?.envelope || entry?.data || entry;
+      const filePath = entry?.path || entry?.filePath || entry?.__path;
+      if (!env || !requestIds.includes(env.replyTo)) continue;
+      if (replies.has(env.from)) continue;
+      const text = typeof env.body === 'string' ? env.body : JSON.stringify(env.body);
+      replies.set(env.from, text);
+      if (filePath) {
+        try {
+          await releaseEnvelope(filePath, 'done');
+        } catch {
+          /* benign — claim race or already-released */
+        }
+      }
+    }
+    if (replies.size < peers.length) {
+      await new Promise((r) => setTimeout(r, DISPATCH_POLL_INTERVAL_MS));
+    }
+  }
+
+  const candidates = Array.from(replies.entries()).map(([jid, reply]) => ({ jid, reply }));
+  const joint_output = await synthesize(candidates, strategy, prompt);
+
+  return {
+    ok: true,
+    joint_output,
+    source_candidates: candidates,
+    trace,
+    fanout_count: peers.length,
+    replied_count: candidates.length,
+  };
+}
+
+async function synthesize(candidates, strategy, originalPrompt) {
+  if (candidates.length === 0) {
+    throw new Error('No candidates returned (all peers timed out)');
+  }
+  if (candidates.length === 1) return candidates[0].reply;
+
+  switch (strategy) {
+    case 'vote':
+      return pickMostCommon(candidates);
+    case 'pick-best':
+      return pickLongestCoherent(candidates);
+    case 'synthesize':
+    default:
+      return await synthesizeViaPeer(candidates, originalPrompt);
+  }
+}
+
+function pickMostCommon(candidates) {
+  // v1 stub: candidate texts are rarely identical so true voting is moot.
+  // Falls back to pick-best behavior. Future versions can normalize text
+  // and group by similarity before voting.
+  return pickLongestCoherent(candidates);
+}
+
+function pickLongestCoherent(candidates) {
+  return candidates.reduce((a, b) =>
+    (b.reply || '').length > (a.reply || '').length ? b : a,
+  ).reply;
+}
+
+async function synthesizeViaPeer(candidates, originalPrompt) {
+  // Ask the configured synthesizer (default @claude) to merge candidates.
+  // If the synthesizer is also among the candidates, fall back to longest
+  // coherent so we don't recurse.
+  const synthesizerJid = process.env.SYNTH_JID || '@claude';
+  if (candidates.some((c) => c.jid === synthesizerJid)) {
+    return pickLongestCoherent(candidates);
+  }
+
+  const prompt = [
+    'You are a synthesizer. You have been given the original question and',
+    'N candidate answers from different LLMs. Produce a single answer that',
+    'is better than any individual candidate. Be concise; do not narrate.',
+    '',
+    `Original question:\n${originalPrompt}`,
+    '',
+    'Candidates:',
+    ...candidates.map((c, i) => `[${i + 1} — ${c.jid}]\n${c.reply}\n`),
+    '',
+    'Your synthesized answer:',
+  ].join('\n');
+
+  const trace = randomUUID();
+  const env = await createEnvelope({
+    from: ME,
+    to: synthesizerJid,
+    kind: 'request',
+    intent: 'synthesize.candidates',
+    body: prompt,
+    room: `#synth-${trace}`,
+    trace,
+  });
+  await writeEnvelopeToBus(env, HUB_BUS_DIR);
+
+  const deadline = Date.now() + SYNTHESIZER_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const inbox = await readInboxFor(ME, HUB_BUS_DIR);
+    for (const entry of inbox) {
+      const r = entry?.envelope || entry?.data || entry;
+      const fp = entry?.path || entry?.filePath || entry?.__path;
+      if (r?.replyTo === env.id) {
+        const text = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+        if (fp) {
+          try {
+            await releaseEnvelope(fp, 'done');
+          } catch {
+            /* ignore */
+          }
+        }
+        return text;
+      }
+    }
+    await new Promise((r) => setTimeout(r, DISPATCH_POLL_INTERVAL_MS));
+  }
+  // Synthesizer timed out — fall back to longest-coherent so we still
+  // return something instead of throwing.
+  return pickLongestCoherent(candidates);
+}
+
+// ─── HTTP face ────────────────────────────────────────────────────────
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body || '{}'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  // ⚠ Loopback-only bind (HOST=127.0.0.1). If you ever expose remotely,
+  // add bearer auth FIRST. See COWORK_HANDOFF §7.5 #13.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  let pathname;
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    pathname = url.pathname.replace(/\/+$/, '') || '/';
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'invalid url' }));
+  }
+
+  // GET /healthz
+  if (pathname === '/healthz' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
+  }
+
+  // POST /dispatch
+  if (pathname === '/dispatch' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      const result = await dispatch(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(
+        JSON.stringify({ ok: false, error: e?.message || String(e) }),
+      );
+    }
+  }
+
+  // GET /participants
+  if (pathname === '/participants' && req.method === 'GET') {
+    try {
+      const cfg = await readParticipants();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(cfg));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: e?.message }));
+    }
+  }
+
+  // PUT /participants
+  if (pathname === '/participants' && req.method === 'PUT') {
+    try {
+      const body = await readJsonBody(req);
+      if (
+        !body ||
+        !Array.isArray(body.lm_studio_slots) ||
+        !Array.isArray(body.external_peers)
+      ) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'invalid shape' }));
+      }
+      await writeParticipants(body);
+      await reconcileBridges(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: true, config: body }));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: e?.message }));
+    }
+  }
+
+  // GET /lmstudio-models — proxy LM Studio's /v1/models for SPA dropdowns
+  if (pathname === '/lmstudio-models' && req.method === 'GET') {
+    try {
+      const r = await fetch(`${LMSTUDIO_BASE_URL}/v1/models`);
+      const data = await r.json();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(data));
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      return res.end(
+        JSON.stringify({
+          ok: false,
+          error: e?.message || 'lmstudio unreachable',
+        }),
+      );
+    }
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: false, error: 'not found', path: pathname }));
+});
+
+server.on('error', (e) => {
+  console.error(`[aggregator] HTTP server error: ${e?.message || e}`);
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[aggregator] listening on http://${HOST}:${PORT}`);
+});
+
+process.on('SIGINT', () => {
+  server.close(() => process.exit(0));
+});
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+});

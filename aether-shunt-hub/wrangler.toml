@@ -1,0 +1,17 @@
+name = "hub-ui"
+account_id = "1e28c63e2fd1a82751bd3b9af105f10f"
+pages_build_output_dir = ".vercel/output/static"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "AUDIT_KV"
+id = "REPLACE_AT_DEPLOY_TIME"
+
+[[kv_namespaces]]
+binding = "AUDIT_FAILURES_KV"
+id = "REPLACE_AT_DEPLOY_TIME"
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "REPLACE_AT_DEPLOY_TIME"

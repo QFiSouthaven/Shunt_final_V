@@ -1,0 +1,6 @@
+{
+  "name": "Cockpit - Systems Operations Console",
+  "description": "A 3-tier master UI for observing and controlling local distributed architecture graphs. Provides a master power panel, circuit layout diagram, and cross-system diagnostics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

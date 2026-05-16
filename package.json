@@ -1,0 +1,48 @@
+{
+  "name": "shunt-final-v",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "dual": "node dual.mjs",
+    "bus:compact": "node hub-bus-tools/compact.mjs",
+    "bus:compact:dry": "node hub-bus-tools/compact.mjs --dry-run",
+    "bus:start": "node hub-bus-tools/orchestrator.mjs",
+    "bus:start:lmstudio-only": "node hub-bus-tools/orchestrator.mjs --only=lmstudio-bridge",
+    "bus:start:adam-only": "node hub-bus-tools/adam-bridge.mjs",
+    "bus:start:with-adam": "node hub-bus-tools/orchestrator.mjs --enable=adam-bridge",
+    "bus:stop": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$procs = Get-CimInstance Win32_Process -Filter \\\"Name='node.exe'\\\" | Where-Object { $_.CommandLine -match 'hub-bus-tools' -or $_.CommandLine -match 'orchestrator\\.mjs' }; if (-not $procs) { Write-Host 'No bus processes found.'; exit 0 }; foreach ($p in $procs) { try { Stop-Process -Id $p.ProcessId -ErrorAction Stop; Write-Host ('Stopped PID ' + $p.ProcessId) } catch { Write-Host ('gentle stop failed for PID ' + $p.ProcessId) } }; Start-Sleep -Seconds 5; $survivors = Get-CimInstance Win32_Process -Filter \\\"Name='node.exe'\\\" | Where-Object { $_.CommandLine -match 'hub-bus-tools' -or $_.CommandLine -match 'orchestrator\\.mjs' }; foreach ($p in $survivors) { Stop-Process -Id $p.ProcessId -Force; Write-Host ('Force-stopped PID ' + $p.ProcessId) }\"",
+    "open:chatroom": "powershell -NoProfile -Command \"Start-Process 'http://localhost:7777'\"",
+    "open:splicer": "powershell -NoProfile -Command \"Start-Process (Join-Path $PWD 'hub-bus-panel/splicer.html')\"",
+    "splicer:desktop": "cd hub-bus-panel-desktop && npm start",
+    "worker:health": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$u='https://hub-relay.halkive.workers.dev'; try { Invoke-RestMethod ($u+'/healthz') | ConvertTo-Json -Compress | Write-Host } catch { Write-Host ('healthz FAIL: '+$_.Exception.Message) }; try { Invoke-RestMethod ($u+'/presence') | Out-Null; Write-Host 'presence (no auth) FAIL: expected 401' } catch { $c=$_.Exception.Response.StatusCode.value__; if ($c -eq 401) { Write-Host 'presence (no auth) PASS: 401' } else { Write-Host ('presence (no auth) FAIL: '+$c) } }; if ($env:HUB_API_SECRET) { try { Invoke-RestMethod ($u+'/presence') -Headers @{Authorization=('Bearer '+$env:HUB_API_SECRET)} | ConvertTo-Json -Compress | Write-Host } catch { Write-Host ('presence (auth) FAIL: '+$_.Exception.Message) } } else { Write-Host 'Set HUB_API_SECRET env var to test authenticated presence.' }\"",
+    "worker:deploy": "cd hub-cloudflare && npx wrangler deploy",
+    "worker:tail": "cd hub-cloudflare && npx wrangler tail",
+    "test:bus": "node -e \"import('node:fs').then(async ({default:fs})=>{import('node:path').then(async ({default:path})=>{import('node:child_process').then(({spawnSync})=>{const dirs=['hub-bus-tools','hub-cloudflare','hub-bus-panel'];let pass=0,fail=0;for(const d of dirs){if(!fs.existsSync(d))continue;for(const f of fs.readdirSync(d).filter(x=>x.startsWith('__test-')&&x.endsWith('.mjs'))){const p=path.join(d,f);console.log('---',p,'---');const r=spawnSync(process.execPath,[p],{stdio:'inherit'});if(r.status===0){console.log('[PASS]',p);pass++}else{console.log('[FAIL]',p);fail++}}}console.log('===',pass,'passed,',fail,'failed ===');process.exit(fail?1:0)})})})\"",
+    "history": "node tools/organize-conversation-history.mjs"
+  },
+  "dependencies": {
+    "@types/dompurify": "^3.0.5",
+    "diff": "5.1.0",
+    "dompurify": "3.0.6",
+    "idb-keyval": "6.2.1",
+    "jszip": "3.10.1",
+    "pdfjs-dist": "4.0.379",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
+    "rehype-raw": "^7.0.0",
+    "remark-gfm": "^4.0.1",
+    "uuid": "9.0.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}

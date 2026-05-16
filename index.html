@@ -1,0 +1,243 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aether Shunt</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.26.1/full/pyodide.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <link rel="stylesheet" href="/styles/globals.css" />
+<script type="module">
+  // AI Self-Healing Protocol — uses the user-configured OpenAI-compatible endpoint.
+
+  const PROJECT_CONTEXT = `This is the Aether Shunt application. It is a React-based AI interface.`;
+
+  const SETTINGS_STORAGE_KEY = 'ai-shunt-settings';
+  const DEFAULT_BASE_URL = 'http://localhost:1234/v1/chat/completions';
+  const DEFAULT_MODEL = 'local-model';
+
+  function readAiSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return {
+        baseUrl: parsed.aiBaseUrl || DEFAULT_BASE_URL,
+        model: parsed.aiModel || DEFAULT_MODEL,
+        apiKey: parsed.aiApiKey || '',
+      };
+    } catch {
+      return { baseUrl: DEFAULT_BASE_URL, model: DEFAULT_MODEL, apiKey: '' };
+    }
+  }
+
+  const SELF_HEAL_PROMPT = (errorLog) => `
+You are the **Host Agent**, a master orchestrator AI. Your purpose is to resolve a critical error within the web application by assembling and directing a team of specialist sub-agents.
+
+**Objective:** Initiate a verifiably validated solutions fix. The solution must be robust, syntactically correct, and address the root cause effectively to get the UI back up and working.
+
+**Your Sub-Agent Team:**
+1.  **React Sub-Agent:** Analyzes component lifecycle, state.
+2.  **System Architect:** Scrutinizes module resolution, import maps, and build configurations.
+3.  **DevOps Sub-Agent:** Reviews environment and security constraints.
+
+**Error Report:**
+\`\`\`json
+${JSON.stringify(errorLog, null, 2)}
+\`\`\`
+---
+**Project Context:**
+\`\`\`markdown
+${PROJECT_CONTEXT}
+\`\`\`
+---
+
+**Mission:**
+Collaboratively diagnose the root cause and generate a complete, production-quality code fix.
+
+Respond ONLY with a JSON object of this exact shape:
+{
+  "internalMonologue": string,
+  "implementationTasks": [{ "filePath": string, "description": string, "newContent": string }]
+}
+`;
+
+  window.enterRecoveryMode = (errorDetails) => {
+      const root = document.getElementById('root');
+      const recoveryOverlay = document.getElementById('recovery-overlay');
+      
+      if (root) root.style.display = 'none';
+      if (recoveryOverlay) recoveryOverlay.classList.remove('hidden');
+      
+      runSelfHeal(errorDetails);
+  }
+
+  async function runSelfHeal(errorDetails) {
+      const recoveryUI = document.getElementById('recovery-content');
+      if (!recoveryUI) return;
+
+      recoveryUI.innerHTML = `
+        <div class="flex flex-col items-center justify-center text-center">
+            <div class="w-16 h-16 border-4 border-fuchsia-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+            <h2 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-fuchsia-400 to-cyan-400 mb-2">System Critical Failure</h2>
+            <p class="text-gray-400 text-lg mb-8">Initiating Autonomous Repair Sequence...</p>
+            
+            <div class="bg-gray-900/80 p-4 rounded-lg border border-red-500/30 max-w-2xl w-full text-left font-mono text-xs text-red-300 overflow-auto max-h-32 mb-8">
+                ${errorDetails.message || 'Unknown Error'}
+            </div>
+
+            <div class="flex items-center gap-2 text-cyan-400 animate-pulse">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clip-rule="evenodd" /></svg>
+                <span class="text-sm font-semibold uppercase tracking-widest">Agent Swarm Active</span>
+            </div>
+        </div>
+      `;
+
+      try {
+          const cfg = readAiSettings();
+          if (!cfg.baseUrl) {
+              throw new Error("AI endpoint not configured. Set it in Settings → AI Provider.");
+          }
+
+          const headers = { 'Content-Type': 'application/json' };
+          if (cfg.apiKey) headers['Authorization'] = `Bearer ${cfg.apiKey}`;
+
+          const httpResponse = await fetch(cfg.baseUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                  model: cfg.model,
+                  messages: [{ role: 'user', content: SELF_HEAL_PROMPT(errorDetails) }],
+                  temperature: 0.1,
+                  stream: false,
+                  response_format: { type: 'json_object' },
+              }),
+          });
+
+          if (!httpResponse.ok) {
+              const errBody = await httpResponse.text().catch(() => '');
+              throw new Error(`AI server responded ${httpResponse.status}: ${errBody || httpResponse.statusText}`);
+          }
+
+          const data = await httpResponse.json();
+          const rawText = data.choices?.[0]?.message?.content ?? '';
+          const jsonText = rawText.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+          const parsedResponse = JSON.parse(jsonText);
+
+          let resultsHTML = `
+            <div class="text-left w-full animate-fade-in">
+                <div class="flex items-center gap-3 mb-6">
+                    <div class="p-2 bg-green-500/20 rounded-full">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    </div>
+                    <div>
+                        <h2 class="text-2xl font-bold text-white">Repair Strategy Generated</h2>
+                        <p class="text-gray-400 text-sm">The agent swarm has analyzed the stack trace and formulated a fix.</p>
+                    </div>
+                </div>
+          `;
+
+          if (parsedResponse.internalMonologue) {
+              resultsHTML += `
+                <details class="mb-6 bg-gray-900/50 p-4 rounded-lg border border-gray-700 w-full group">
+                    <summary class="cursor-pointer font-semibold text-gray-300 hover:text-white transition-colors flex items-center gap-2 select-none">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 transform group-open:rotate-90 transition-transform" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clip-rule="evenodd" /></svg>
+                        Agent Swarm Reasoning
+                    </summary>
+                    <div class="mt-3 pt-3 border-t border-gray-700/50">
+                        <pre class="whitespace-pre-wrap text-xs text-gray-400 font-mono leading-relaxed">${parsedResponse.internalMonologue}</pre>
+                    </div>
+                </details>
+              `;
+          }
+
+          parsedResponse.implementationTasks.forEach(task => {
+              resultsHTML += `
+                <div class="bg-black/40 border border-gray-700 rounded-lg mb-4 w-full overflow-hidden shadow-lg">
+                    <div class="p-3 border-b border-gray-700 flex justify-between items-center bg-gray-800/30">
+                        <div class="flex items-center gap-2">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-blue-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd" /></svg>
+                            <p class="font-mono text-sm text-blue-300">${task.filePath}</p>
+                        </div>
+                        <button class="copy-btn text-xs bg-gray-700 hover:bg-gray-600 text-gray-200 px-3 py-1.5 rounded transition-colors border border-gray-600 flex items-center gap-2" data-content="${encodeURIComponent(task.newContent)}">
+                            <span>Copy Code</span>
+                        </button>
+                    </div>
+                    <div class="relative group">
+                        <pre class="p-4 text-xs whitespace-pre-wrap break-all font-mono text-gray-300 max-h-80 overflow-auto custom-scrollbar">${task.newContent.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>
+                    </div>
+                </div>
+              `;
+          });
+          
+          resultsHTML += `
+            <div class="mt-6 flex justify-end">
+                <button onclick="window.location.reload()" class="px-6 py-3 bg-fuchsia-600 hover:bg-fuchsia-500 text-white font-semibold rounded-md shadow-lg transition-all flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                    Reload Application
+                </button>
+            </div>
+          </div>`;
+          
+          recoveryUI.innerHTML = resultsHTML;
+
+          document.querySelectorAll('.copy-btn').forEach(button => {
+              button.addEventListener('click', (e) => {
+                  const content = decodeURIComponent(e.currentTarget.dataset.content);
+                  navigator.clipboard.writeText(content);
+                  const originalText = e.currentTarget.innerHTML;
+                  e.currentTarget.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg> Copied!`;
+                  e.currentTarget.classList.add('bg-green-600', 'text-white', 'border-green-500');
+                  setTimeout(() => { 
+                      e.currentTarget.innerHTML = originalText; 
+                      e.currentTarget.classList.remove('bg-green-600', 'text-white', 'border-green-500');
+                  }, 2000);
+              });
+          });
+
+      } catch (e) {
+          recoveryUI.innerHTML = `
+            <div class="text-center animate-fade-in">
+                <div class="inline-block p-4 bg-red-900/30 rounded-full mb-6 ring-4 ring-red-900/20">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                </div>
+                <h2 class="text-2xl font-bold text-red-400 mb-2">Auto-Fix Protocol Failed</h2>
+                <p class="text-gray-400 text-sm mb-6">The agent swarm could not complete the repair sequence.</p>
+                <div class="bg-black/50 border border-red-900/50 text-red-300 rounded-lg p-4 text-left font-mono text-xs overflow-auto max-h-48 shadow-inner">
+                    ${e.message || 'An unknown error occurred during the AI request.'}
+                </div>
+                <button onclick="window.location.reload()" class="mt-6 px-6 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-md transition-colors">
+                    Reload Page
+                </button>
+            </div>
+          `;
+          console.error("Self-Heal AI Error:", e);
+      }
+  }
+
+  window.onerror = (message, source, lineno, colno, error) => {
+      // Trigger recovery mode only for module/import-resolution failures that actually
+      // blank the screen. NOTE: do not match generic JSON.parse errors like "Invalid or
+      // unexpected token" because they fire from user code paths and would hide real bugs.
+      if (typeof message === 'string' && (
+          message.includes('Failed to resolve module specifier') ||
+          message.includes('Failed to fetch dynamically imported module') ||
+          message.includes('Importing a module script failed') ||
+          message.includes('blocked by a null value')
+      )) {
+          window.enterRecoveryMode({ message, source, lineno, colno });
+          return true; // Suppress default error handling
+      }
+  };
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+    <div id="recovery-overlay" class="hidden fixed inset-0 bg-black z-[9999] flex items-center justify-center p-10">
+        <div id="recovery-content" class="max-w-4xl w-full"></div>
+    </div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>

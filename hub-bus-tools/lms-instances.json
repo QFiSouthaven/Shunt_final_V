@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "comment": "Pattern Z Phase 2 seed. Each entry in slots[] becomes one lmstudio-bridge-* child of the orchestrator. The bridge receives LMSTUDIO_JID via env; when model is null the bridge auto-resolves via LM Studio's /v1/models. After Phase 3 ships the aggregator, hub-bus/participants.json takes over as the runtime source of truth (this file remains the committed default seed). UI changes via PUT /participants reconcile bridges through orchestrator's HTTP admin face. See PATTERN_Z_BUILD_PLAN_2026-05-13.md §3.2.",
+  "slots": [
+    {
+      "jid": "@lmstudio-1",
+      "model": null,
+      "enabled": true
+    }
+  ]
+}

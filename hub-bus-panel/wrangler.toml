@@ -1,0 +1,4 @@
+name = "aether-shunt-panel"
+account_id = "c6e9f3ff4b3d684700718224c6a63ec4"
+compatibility_date = "2026-05-08"
+pages_build_output_dir = "."

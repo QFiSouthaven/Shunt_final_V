@@ -1,0 +1,53 @@
+{
+  "name": "aether-splicer-desktop",
+  "version": "0.1.0",
+  "description": "Native desktop wrapper for the Aether Splicer chat panel — minimize-to-tray, OS-keychain credential storage, native notifications.",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "postinstall": "node gen-icon.cjs",
+    "icon": "node gen-icon.cjs",
+    "prestart": "node -e \"require('node:fs').existsSync('tray-icon.png')||require('node:child_process').execSync('node gen-icon.cjs',{stdio:'inherit'})\"",
+    "start": "electron .",
+    "dev": "electron .",
+    "prebuild": "node -e \"require('node:fs').existsSync('tray-icon.png')||require('node:child_process').execSync('node gen-icon.cjs',{stdio:'inherit'})\"",
+    "build": "electron-builder --win nsis",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.halkive.aether-splicer",
+    "productName": "Aether Splicer",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "notify.js",
+      "splicer.html",
+      "tray-icon.png",
+      "gen-icon.cjs"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "tray-icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Aether Splicer"
+    }
+  }
+}
