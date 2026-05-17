@@ -21,6 +21,18 @@ const TAG_JID_PREFIX = 'jid:';
 /** WS tag prefix used to identify the room a connection joined. */
 const TAG_ROOM_PREFIX = 'room:';
 
+/** Min interval between hop-counter garbage sweeps per DO instance (ms). */
+const HOP_SWEEP_INTERVAL_MS = 60_000;
+/** Max keys deleted per sweep — keep the operation bounded. */
+const HOP_SWEEP_MAX_DELETES = 200;
+
+/** P1 #1 — hop counter row now stores its own expiry so it can be evicted. */
+interface HopCounterEntry {
+  hops: number;
+  /** ms since epoch — past this, the trace is dead and the row sweepable. */
+  expiresAt: number;
+}
+
 /**
  * One DO instance per `#room` (the Worker calls
  * `env.HUB_ROOM.idFromName(roomName)`). Holds connected JIDs, presence, and
@@ -31,6 +43,10 @@ export class HubRoom implements DurableObject {
   private readonly env: Env;
   // In-memory cache of hop ceiling — refreshed lazily from storage.
   private hopCeilingCache: number | null = null;
+  // P1 #1 — last time we ran the stale-hop-counter sweep (ms since epoch).
+  // In-memory only; on hibernation/wakeup, the sweep runs again as soon as
+  // an envelope arrives, which is exactly what we want.
+  private lastHopSweepAt: number = 0;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -408,9 +424,21 @@ export class HubRoom implements DurableObject {
     }
 
     // Locked decision s14: per-room hop ceiling on `trace`. Default 8.
+    // P1 #1 — hop counters used to leak one row per trace forever. Now stored
+    // with the envelope's expiresAt and opportunistically swept by
+    // sweepStaleHopCounters() (rate-limited to 1/min per DO instance).
     const ceiling = await this.getHopCeiling();
     const hopKey = `trace:${env.trace}:hops`;
-    const currentHops = (await this.state.storage.get<number>(hopKey)) ?? 0;
+    const storedHop = await this.state.storage.get<HopCounterEntry | number>(hopKey);
+    // Back-compat: pre-2026-05-16 entries were stored as a bare number. Detect
+    // and migrate inline. (The sweep also deletes any old-format entry that
+    // happens to still be sitting around.)
+    const currentHops =
+      typeof storedHop === 'number'
+        ? storedHop
+        : storedHop && typeof storedHop.hops === 'number'
+          ? storedHop.hops
+          : 0;
     if (currentHops >= ceiling) {
       audit(env, currentHops + 1, ceiling);
       return {
@@ -420,7 +448,22 @@ export class HubRoom implements DurableObject {
       };
     }
     const nextHops = currentHops + 1;
-    await this.state.storage.put(hopKey, nextHops);
+    // Preserve the FIRST envelope's expiresAt for the trace if we already have
+    // it; otherwise stamp with this envelope's expiresAt. Either way, the
+    // counter expires whenever the trace's envelopes do.
+    const existingExpiresAt =
+      typeof storedHop === 'object' && storedHop !== null && typeof storedHop.expiresAt === 'number'
+        ? storedHop.expiresAt
+        : null;
+    const nextEntry: HopCounterEntry = {
+      hops: nextHops,
+      expiresAt: existingExpiresAt ?? (Date.parse(env.expiresAt) || Date.now() + 5 * 60_000),
+    };
+    await this.state.storage.put(hopKey, nextEntry);
+
+    // Opportunistic sweep — at most once per minute per DO, runs after the
+    // write so it doesn't gate hot-path latency.
+    this.maybeSweepStaleHopCounters().catch(() => { /* swallow; best-effort */ });
 
     // Passive Auditor — locked decision s14. Never blocks; always logs.
     audit(env, nextHops, ceiling);
@@ -487,6 +530,39 @@ export class HubRoom implements DurableObject {
     const stored = await this.state.storage.get<number>('config:hop_ceiling');
     this.hopCeilingCache = typeof stored === 'number' ? stored : DEFAULT_HOP_CEILING;
     return this.hopCeilingCache;
+  }
+
+  /**
+   * P1 #1 — opportunistic sweep of expired hop-counter rows. Bounded by:
+   *   - HOP_SWEEP_INTERVAL_MS — at most one sweep per minute per DO instance
+   *   - HOP_SWEEP_MAX_DELETES — at most 200 keys deleted per sweep
+   *
+   * Both an envelope's `expiresAt` (typical ~minutes) and the per-room hop
+   * ceiling bound trace lifetime, so a sweep every minute is plenty. The
+   * sweep is fire-and-forget from routeEnvelope — never gates hot-path latency.
+   */
+  private async maybeSweepStaleHopCounters(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastHopSweepAt < HOP_SWEEP_INTERVAL_MS) return;
+    this.lastHopSweepAt = now;
+
+    const list = await this.state.storage.list<HopCounterEntry | number>({
+      prefix: 'trace:',
+    });
+    const toDelete: string[] = [];
+    for (const [key, value] of list) {
+      // Old-format entries (bare number) have no expiresAt — collect them
+      // anyway; they're unreachable garbage on the new code path.
+      if (typeof value === 'number') {
+        toDelete.push(key);
+      } else if (value && typeof value.expiresAt === 'number' && value.expiresAt <= now) {
+        toDelete.push(key);
+      }
+      if (toDelete.length >= HOP_SWEEP_MAX_DELETES) break;
+    }
+    if (toDelete.length > 0) {
+      await this.state.storage.delete(toDelete);
+    }
   }
 
   /**

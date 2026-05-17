@@ -890,3 +890,13 @@ Single-looped sender could exhaust free-tier ceilings in minutes. Fixed.
 **Scope deliberately limited.** This is per-room (one DO per room). A sender looping across many rooms has separate buckets per room. For a global cap, a separate shared-state DO is needed — deferred. The per-room cap still reduces blast radius significantly (a flood in one room doesn't poison others).
 
 **Verification.** Worker `npx tsc --noEmit` clean. Live deploy is operator action (`cd hub-cloudflare && npx wrangler deploy`). To verify post-deploy: hammer `/send` from a single JID until 429 appears; check `Retry-After` matches the deficit in seconds.
+
+#### P1 #1 — hop counter eviction (Worker)
+
+Hop counters at `trace:<trace>:hops` in DO storage used to leak one row per trace forever. Fixed with an opportunistic sweep.
+
+- **`hub-room.ts`** — new `HopCounterEntry` shape `{ hops, expiresAt }`. The expiresAt is taken from the first envelope in the trace (preserved across hops), and falls back to `now + 5min` if the envelope's expiresAt is unparseable. Old-format entries (bare number) are migrated inline on read.
+- **`maybeSweepStaleHopCounters()`** — fires at most once per 60s per DO instance. Lists `trace:` prefix, deletes any entry past expiresAt (or any old-format bare-number entry, which is now unreachable garbage). Capped at 200 deletes per sweep so a backlog doesn't stall hot path. Called fire-and-forget from `routeEnvelope` after the hop write — never gates latency.
+- **Memory only** — `lastHopSweepAt` is in-memory; on DO hibernation/wake, the next envelope triggers another sweep, which is the desired behavior.
+
+**Verification.** TS clean. Post-deploy verification: trigger one hop, wait for trace to expire, send another envelope (different trace) to fire a sweep, observe via `wrangler tail` that the trace key disappeared.
