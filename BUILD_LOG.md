@@ -1011,3 +1011,35 @@ Previous DSL only handled object-with-primitive-fields. Couldn't express arrays,
 **Verification.** Worker `tsc --noEmit` clean.
 
 **Still deferred to v0.3:** full JSON-Schema → Zod converter (cross-field refinements, $ref, allOf/anyOf, conditional schemas). The hand-rolled DSL is now expressive enough for the realistic v0.2/v0.3 room schemas we'd write by hand.
+
+#### Phase C summary — all P1 + Task #17 resolved (2026-05-17)
+
+STATE_SNAPSHOT.md §4 had 11 P1 backlog items; STATE_SNAPSHOT.md §3 had Task #17 pending. Status post-Phase C:
+
+| # | Item | Status | Commit |
+|---|------|--------|--------|
+| 1 | Hop counter eviction (DO) | ✅ shipped | `4426bea` |
+| 2 | /presence mirrors WS upgrades (KV) | ✅ already done before Phase C (verified at `hub-room.ts:109`) | — |
+| 3 | Per-JID presence files (race) | ✅ shipped | `95c166c` |
+| 4 | Deterministic-id includes intent + kind | ✅ shipped | `c38b3ed` |
+| 5 | Transcript ordering: server-side seq | ✅ shipped | `bd6db65` |
+| 6 | Per-JID rate limits | ✅ shipped | `95b44ef` |
+| 7 | sig/issuer namespaced under _unverified | ✅ shipped | `9ef1585` |
+| 8 | Panel CORS allowlist | ✅ shipped | `06c2628` |
+| 9 | permanently_failed → presence offline | ✅ shipped | `4403c1c` |
+| 10 | Tunnel URL rotation | ✅ N/A in current arch (no hardcoded tunnel URLs) | — |
+| 11 | Type-Safe Rooms DSL (Task #17) | ✅ shipped (subset; v0.3 = full JSON-Schema) | `3078544` |
+
+**STATE_SNAPSHOT §5 cleanup** (`__check_*.mjs`, `envelope.fresh.ts`): verified already deleted from tree.
+
+**Required operator actions before Phase C ships in production:**
+1. `cd hub-cloudflare && npx wrangler d1 execute hub_transcripts --remote --file=./migrations/0004_server_seq.sql` (P1 #5).
+2. `cd hub-cloudflare && npx wrangler deploy` — pushes the Worker changes (P1 #1, #5, #6, #7, #11).
+3. Restart the bus on each host (`npm run bus:stop` then `npm run bus:start`) — picks up P1 #3, #4, #7, #8, #9 in the bridges.
+
+After (2), to verify the Worker layer:
+- Hammer `/send` from one JID until HTTP 429 + Retry-After appears (P1 #6).
+- Send a few envelopes, query D1 transcripts: `SELECT id, server_seq FROM transcripts ORDER BY server_seq DESC LIMIT 5` should show monotonically increasing per-room seqs (P1 #5).
+- Send an envelope with top-level `sig: "x"`; query D1 transcripts to confirm `signature` column populated; check via dashboard or `wrangler tail` that the routed envelope no longer carries top-level `sig`/`issuer` (P1 #7 namespacing).
+
+**STATE_SNAPSHOT.md** is now stale (its §3 + §4 are resolved). Not rewriting in place — BUILD_LOG entries above are the source of truth. Operators reading STATE_SNAPSHOT should cross-reference this section.
