@@ -8,6 +8,7 @@ import { MCPConnectionStatus } from '@/types/mcp';
 import { BoltIcon, ServerStackIcon, XMarkIcon, CpuChipIcon } from '../icons';
 import Loader from '../Loader';
 import PatternZPanel from './PatternZPanel';
+import BusControl from './BusControl';
 
 const Settings: React.FC = () => {
     const { settings, updateSetting } = useSettings();
@@ -152,6 +153,8 @@ const Settings: React.FC = () => {
                                 </div>
                             </div>
                         </div>
+
+                        <BusControl />
 
                         <PatternZPanel />
 

@@ -1106,3 +1106,17 @@ Three parallel audit agents (hub-bus-tools / hub-cloudflare / SPA UI) returned 8
 - `MiaChat.tsx:150` weak list key (array index) — true but only fires if `agentLog` is ever mutated mid-stream, which doesn't happen in the current flow.
 
 **Verification.** `node --check` clean on the three bus files. `npx tsc --noEmit` clean (only the pre-existing `tools/organize-conversation-history.mjs:684` warning).
+
+### Bus Control panel in SPA Settings (2026-05-17)
+
+Operator asked for "start bus button on the SPA UI." Honest scope: browsers can't spawn `node` processes. What this panel CAN do, it does:
+
+- **`hooks/components/settings/BusControl.tsx`** (NEW). Polls the orchestrator's existing HTTP admin face at `http://127.0.0.1:7779/status` every 5s (8s when down). The orchestrator already had CORS open (loopback `*`) so no Worker-side change needed.
+- **When bus IS running:** lists every child supervisor with state, PID, restart count, uptime. Per-child Start / Stop / Restart buttons hit the existing `POST /start/:name`, `/stop/:name`, `/restart/:name` endpoints. Shows a `<details>` block of recent `last_error` strings if any.
+- **When bus is NOT running:** shows a "Bus is not running" notice with a one-click "Copy" button that writes `cd C:\Users\Falki\shunt-final-v; npm run bus:start` to the clipboard. Operator pastes into PowerShell; the panel auto-detects the bus coming up within ~8s.
+- **Field-name fix during implementation:** the orchestrator's `ChildSupervisor.toJSON()` returns snake_case (`started_at`, `last_exit_code`, `last_error`, `restart_due_at`) — `BusControl`'s TypeScript interface now matches; existing consumers (`aether-shunt-hub`, cockpit) already decode this shape, so leaving the wire format alone.
+- **Wired into `Settings.tsx`** above the existing `<PatternZPanel />` since the bus is the prerequisite for Pattern Z fan-out.
+
+**Not in this commit (deferred):** an actual "Start" button that spawns the orchestrator. That requires either a small launcher daemon running at boot (tray app / Windows service / `pm2`-style supervisor) or the operator manually starting once per session. Until then, the copy-command UX is the realistic shape.
+
+**Verification.** `tsc --noEmit` clean.
