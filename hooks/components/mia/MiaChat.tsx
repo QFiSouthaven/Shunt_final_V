@@ -95,7 +95,6 @@ const MiaChat: React.FC = () => {
     shunt: { label: "Analyze Shunt's Input", command: 'summarize: ' },
     weaver: { label: 'Summarize Weaver Goal', command: 'summarize: ' },
     image_analysis: { label: 'Describe current image', command: 'describe: ' },
-    orchestrator: { label: 'Explain Orchestrator graph', command: 'explain: ' },
   };
 
   const suggestion = activeTab ? contextualActions[activeTab] : null;

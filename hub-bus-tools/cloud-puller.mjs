@@ -139,12 +139,18 @@ function connectOne(jid) {
   let backoffMs = 1000;
   let connectedAt = 0;
   let stopped = false;
+  // Track outstanding timers so close/stop can cancel them. Without this, the
+  // backoff-reset setTimeout would keep firing against a closed/replaced ws
+  // long after disconnect — wasted memory and stale closures.
+  let reconnectTimer = null;
+  let resetBackoffTimer = null;
 
   function scheduleReconnect() {
     if (stopped) return;
     const wait = Math.min(backoffMs, MAX_BACKOFF_MS);
     warn(jid, `reconnect in ${wait}ms`);
-    setTimeout(open, wait);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; open(); }, wait);
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
   }
 
@@ -165,7 +171,11 @@ function connectOne(jid) {
       log(jid, `connected to ${WORKER_URL}/ws (room=${ROOM})`);
       // Reset backoff after a stable connection — but only after UPTIME_RESET_MS
       // of uptime, so a flap-loop doesn't masquerade as a healthy reconnect.
-      setTimeout(() => {
+      // Cancel any prior reset timer first (e.g. a reconnect that opened, closed,
+      // and is opening again within UPTIME_RESET_MS).
+      if (resetBackoffTimer) clearTimeout(resetBackoffTimer);
+      resetBackoffTimer = setTimeout(() => {
+        resetBackoffTimer = null;
         if (ws.readyState === WebSocket.OPEN && Date.now() - connectedAt >= UPTIME_RESET_MS) {
           backoffMs = 1000;
         }
@@ -186,6 +196,9 @@ function connectOne(jid) {
 
     ws.addEventListener('close', (ev) => {
       log(jid, `closed code=${ev.code} reason=${ev.reason || '<none>'}`);
+      // Cancel a pending backoff-reset; this WS is gone, the timer's check
+      // would be against a stale reference.
+      if (resetBackoffTimer) { clearTimeout(resetBackoffTimer); resetBackoffTimer = null; }
       scheduleReconnect();
     });
   }
@@ -193,6 +206,8 @@ function connectOne(jid) {
   open();
   return () => {
     stopped = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (resetBackoffTimer) { clearTimeout(resetBackoffTimer); resetBackoffTimer = null; }
   };
 }
 

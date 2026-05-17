@@ -32,6 +32,7 @@
 // hiccups.
 
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import {
   mkdir,
   writeFile,
@@ -44,10 +45,13 @@ import path from 'node:path';
 
 /**
  * Default bus directory. Used by `nextSeq` when the caller doesn't supply one.
- * Override with the BUS_DIR env var.
+ * Override with the BUS_DIR env var. Falls back to `<repo-root>/hub-bus` —
+ * the module sits at `<repo>/hub-bus-tools/envelope.mjs`, so two `..` up from
+ * the module URL puts us at the repo root.
  */
 const DEFAULT_BUS_DIR =
-  process.env.BUS_DIR || 'C:\\Users\\Falki\\shunt-final-v\\hub-bus';
+  process.env.BUS_DIR ||
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'hub-bus');
 
 /**
  * Legacy file-bus → canonical Worker `kind` translation table.

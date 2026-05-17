@@ -1088,3 +1088,21 @@ API signature unchanged. The single caller `hooks/components/image_analysis/Imag
 **Kept:** `BUILD_LOG.md` (source of truth), `HANDBOOK.md` (live operator reference), `STATE_SNAPSHOT.md` (stale §3/§4 but useful for cloud-resource IDs), `PATTERN_Z_BUILD_PLAN_2026-05-13.md` (still contains detailed phase save-markers that BUILD_LOG entries reference; operator can delete when comfortable), `docs/PHASE_A_SMOKE_CHECKLIST.md` (operator-facing test list).
 
 Repo plan-doc count: 12 → 6.
+
+### Parallel audit findings — fixes (2026-05-17)
+
+Three parallel audit agents (hub-bus-tools / hub-cloudflare / SPA UI) returned 8 findings. Four genuine bugs; four false-positives or cosmetic:
+
+**Fixed:**
+- **HIGH `envelope.mjs:50`** — `DEFAULT_BUS_DIR` had a hardcoded fallback `C:\Users\Falki\shunt-final-v\hub-bus`. Breaks on any other machine. Replaced with `path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'hub-bus')` so the fallback computes the repo-relative path at module load.
+- **MEDIUM `cloud-puller.mjs`** — backoff-reset `setTimeout` and reconnect `setTimeout` weren't stored, so they kept firing against closed/replaced WebSockets and couldn't be cancelled on shutdown. Both timers now tracked (`reconnectTimer`, `resetBackoffTimer`), cancelled on `close` and on the returned stopper. No more dangling callbacks against stale `ws` closures.
+- **MEDIUM `panel-server.mjs:338-340`** — the `/api/send` handler was assigning `env.intent = intent.slice(0,64)` AFTER `createEnvelope` had already returned the envelope, bypassing the same `String()` coercion + truthy-check that P1 #4 added to createEnvelope. Now `intent` is passed through the createEnvelope param list, consistent with every other caller.
+- **MEDIUM `MiaChat.tsx:98`** — `contextualActions` still had an `orchestrator: { label: 'Explain Orchestrator graph', ... }` entry. The `orchestrator` tab key was pruned in Phase A.2, so this row could never match. Silent no-op (the conditional that reads it returns null when no match) but dead code; removed.
+
+**Not actionable (false positives or cosmetic):**
+- `type-safe-rooms.ts:318` `t.optional()` — agent flagged as possible null deref, but every switch case either assigns `t` non-null or `return null`s. TS control-flow analysis is happy; no runtime risk.
+- `hub-room.ts:460` `Date.parse(env.expiresAt) || Date.now() + 5*60_000` — the only way to fall through to the fallback inappropriately would be an envelope with `expiresAt: 1970-01-01T00:00:00Z`. Not realistic; even if it happened, the fallback gives the trace 5 more minutes — fine.
+- `envelope.ts:117` — `_unverified` merge can produce `{ sig: x, issuer: undefined }`. Zod's `.optional()` treats explicit undefined as absent, behaviorally identical. Cosmetic.
+- `MiaChat.tsx:150` weak list key (array index) — true but only fires if `agentLog` is ever mutated mid-stream, which doesn't happen in the current flow.
+
+**Verification.** `node --check` clean on the three bus files. `npx tsc --noEmit` clean (only the pre-existing `tools/organize-conversation-history.mjs:684` warning).

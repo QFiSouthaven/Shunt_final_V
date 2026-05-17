@@ -326,18 +326,21 @@ async function handle(req, res) {
     if (to === '*' && kind !== 'broadcast') kind = 'broadcast';
 
     try {
+      // Pass intent through createEnvelope (P1 #4 fix taught createEnvelope to
+      // accept and emit it). Post-hoc assignment used to bypass the same
+      // normalization other callers get; now uniform.
+      const trimmedIntent =
+        typeof intent === 'string' && intent.length > 0 ? intent.slice(0, 64) : undefined;
       const envOpts = {
         from: '@zack',
         to,
         kind,
+        intent: trimmedIntent,
         body,
         room,
         busDir: BUS_DIR,
       };
       const env = await createEnvelope(envOpts);
-      if (typeof intent === 'string' && intent.length > 0) {
-        env.intent = intent.slice(0, 64);
-      }
       await writeEnvelopeToBus(env, BUS_DIR);
       return sendJson(res, 200, { ok: true, id: env.id, ts: env.ts });
     } catch (err) {
