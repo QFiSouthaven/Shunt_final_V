@@ -44,6 +44,8 @@ dist-ssr
 
 # Claude Code per-machine local overrides (project-shared settings.json is committed)
 .claude/settings.local.json
+# Claude Code worktrees (per-session ephemeral checkouts; not the canonical tree)
+.claude/worktrees/
 
 # Windows / OS
 Thumbs.db
