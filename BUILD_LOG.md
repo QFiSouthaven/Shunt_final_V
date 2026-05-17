@@ -960,3 +960,22 @@ A bridge that exhausts its restart budget previously stayed "online" in `presenc
 **Aggregation semantics.** The shared `presence.json` is no longer authoritative. The panel-server merges per-JID files at read time. A future operator-facing view that needs `{ agents, rooms }` can do the same merge (also documented for `cloud-puller.discoverJids`).
 
 **Verification.** `node --check` clean on all three modified files.
+
+#### P1 #5 — transcript ordering: server-side seq from DO
+
+`hub-bus/transcript.jsonl` was ordered by writer wallclock (first-to-`appendJsonLine` wins line position). D1 `transcripts` is ordered by row insertion. Cross-machine clock skew → the two orderings disagree → consumers can't reconstruct causal order from either alone. Fix: the DO mints a per-room monotonic seq at record time.
+
+- **`migrations/0004_server_seq.sql`** — `ALTER TABLE transcripts ADD COLUMN server_seq INTEGER` + composite index `idx_transcripts_room_server_seq (room, server_seq)`. NULL is permitted for legacy rows (back-fill is a separate operator decision).
+- **`hub-cloudflare/src/transcript.ts`** — `recordEnvelope(env, db, room, serverSeq=null)` gains a 4th arg, writes it to the new column.
+- **`hub-cloudflare/src/hub-room.ts`** — `nextServerSeq()` reads `config:server_seq` from DO storage, increments, writes back. Single-threaded DO request handling means the RMW can't interleave; no locking needed. Both `routeEnvelope` call sites (the `join` early-return and the main route path) mint a serverSeq before passing it to `recordEnvelope`.
+
+**Authoritative ordering** going forward: `ORDER BY server_seq` (or `ORDER BY room, server_seq`). Existing readers ordering by `ts` continue to work; their ordering is just less reliable across writers.
+
+**Operator action.** Apply the migration before redeploying:
+```powershell
+cd hub-cloudflare
+npx wrangler d1 execute hub_transcripts --remote --file=./migrations/0004_server_seq.sql
+npx wrangler deploy
+```
+
+**Verification.** Worker `tsc --noEmit` clean.

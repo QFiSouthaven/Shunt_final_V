@@ -478,8 +478,9 @@ export class HubRoom implements DurableObject {
       };
       await this.state.storage.put(`presence:${env.from}`, entry);
       await this.broadcastPresenceChange(env.room, env.from, entry, 'join');
-      // Best-effort persistence of the join itself.
-      await recordEnvelope(env, this.env.HUB_TRANSCRIPTS, env.room);
+      // Best-effort persistence of the join itself. P1 #5 — mint server_seq.
+      const joinSeq = await this.nextServerSeq();
+      await recordEnvelope(env, this.env.HUB_TRANSCRIPTS, env.room, joinSeq);
       // Mirror to KV for cross-room aggregate /presence queries.
       await this.kvUpsertPresence(env.from, entry);
       return { ok: true, delivered: 1 };
@@ -515,8 +516,10 @@ export class HubRoom implements DurableObject {
       }
     }
 
-    // Append to transcript regardless of delivery success.
-    await recordEnvelope(env, this.env.HUB_TRANSCRIPTS, env.room);
+    // Append to transcript regardless of delivery success. P1 #5 — mint
+    // server_seq for authoritative ordering independent of clock skew.
+    const serverSeq = await this.nextServerSeq();
+    await recordEnvelope(env, this.env.HUB_TRANSCRIPTS, env.room, serverSeq);
 
     return { ok: true, delivered };
   }
@@ -530,6 +533,27 @@ export class HubRoom implements DurableObject {
     const stored = await this.state.storage.get<number>('config:hop_ceiling');
     this.hopCeilingCache = typeof stored === 'number' ? stored : DEFAULT_HOP_CEILING;
     return this.hopCeilingCache;
+  }
+
+  /**
+   * P1 #5 — mint the next per-room monotonic sequence number for D1
+   * transcript ordering. Counter lives at `config:server_seq` in DO storage.
+   *
+   * Why this matters: hub-bus/transcript.jsonl is ordered by writer wallclock
+   * and D1 transcripts is ordered by row insertion. Cross-machine clock skew
+   * desyncs them. A server-side seq from the DO is the only authoritative
+   * ordering (the DO is the routing boundary; everything flows through one
+   * DO instance per room).
+   *
+   * The DO's `state.blockConcurrencyWhile` semantics + single-threaded request
+   * handling mean the read-modify-write here can't interleave with another
+   * envelope's mint in the same DO. No locking required.
+   */
+  private async nextServerSeq(): Promise<number> {
+    const current = (await this.state.storage.get<number>('config:server_seq')) ?? 0;
+    const next = current + 1;
+    await this.state.storage.put('config:server_seq', next);
+    return next;
   }
 
   /**

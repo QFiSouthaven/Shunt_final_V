@@ -13,14 +13,16 @@ import { type Envelope, legacyTtlToExpiresAt } from './envelope.js';
  * Locked decision §14: the DO is the routing boundary; it must never block on
  * audit/transcript I/O.
  *
- * Schema v0.2.1: writes `expires_at` and `issuer` columns added by
- * `migrations/0003_envelope_metadata.sql`. If a legacy envelope arrives
- * without `expiresAt`, backfill it from `ttl`+`ts` via legacyTtlToExpiresAt.
+ * Schema v0.2.2: writes `server_seq` column added by
+ * `migrations/0004_server_seq.sql`. Caller is responsible for minting the
+ * `serverSeq` value via per-room monotonic counter in DO storage; the
+ * transcript writer just persists it. NULL is permitted for legacy rows.
  */
 export async function recordEnvelope(
   env: Envelope,
   db: D1Database,
   room: string,
+  serverSeq: number | null = null,
 ): Promise<void> {
   try {
     let expiresAt: string | null = env.expiresAt ?? null;
@@ -35,8 +37,8 @@ export async function recordEnvelope(
       .prepare(
         `INSERT INTO transcripts (
           id, room, ts, sender, recipient, kind, intent, trace, seq, body,
-          signature, expires_at, issuer
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          signature, expires_at, issuer, server_seq
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         env.id,
@@ -55,6 +57,9 @@ export async function recordEnvelope(
         env._unverified?.sig ?? null,
         expiresAt,
         env._unverified?.issuer ?? null,
+        // P1 #5 — per-room monotonic seq minted by the DO at routeEnvelope time.
+        // Authoritative ordering independent of writer wallclock / clock skew.
+        serverSeq,
       )
       .run();
   } catch (err) {
