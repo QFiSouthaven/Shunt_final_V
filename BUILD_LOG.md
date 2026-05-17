@@ -1043,3 +1043,29 @@ After (2), to verify the Worker layer:
 - Send an envelope with top-level `sig: "x"`; query D1 transcripts to confirm `signature` column populated; check via dashboard or `wrangler tail` that the routed envelope no longer carries top-level `sig`/`issuer` (P1 #7 namespacing).
 
 **STATE_SNAPSHOT.md** is now stale (its §3 + §4 are resolved). Not rewriting in place — BUILD_LOG entries above are the source of truth. Operators reading STATE_SNAPSHOT should cross-reference this section.
+
+### Pattern Z Phase 5+6 — SPA bus dispatch wired (2026-05-17)
+
+Pattern Z Phase 4 (Participants UI in Settings tab) had already been shipped by a prior session — `hooks/components/settings/PatternZPanel.tsx` exists at 288 lines and is imported into Settings.tsx; SettingsContext already carries `patternZEnabled`/`patternZStrategy`/`patternZTimeoutMs` defaults. BUILD_LOG just hadn't recorded it. Phase 5 (basic dispatch + amplify pilot) and Phase 6 (strategy map + helper) were genuinely missing in aiService.ts.
+
+- **`styles/services/patternZStrategies.ts`** (NEW). Type `Strategy = 'vote' | 'pick-best' | 'synthesize' | 'single'`. `DEFAULT_BUTTON_STRATEGIES` maps known intents to strategies (e.g. `shunt.amplify → synthesize`, `imageAnalysis.preset → single`). `strategyFor(intent, settingsDefault, overrides?)` does the lookup with three-level fallback: explicit override → known default → settings default.
+- **`styles/services/aiService.ts`**:
+  - `isPatternZEnabled()`, `getPatternZStrategy()`, `getPatternZTimeoutMs()` — read from the same `ai-shunt-settings` localStorage key the SettingsContext uses, with safe defaults.
+  - `dispatchToBus({intent, prompt, strategy?})` — POSTs to `http://127.0.0.1:7780/dispatch` (the aggregator). Throws on HTTP error or `{ok:false}` response. Refuses `strategy:'single'` defensively.
+  - `maybeDispatch(intent, buildPrompt, singleLlmFallback)` — generic wrapper for future call-site adoption: checks `isPatternZEnabled` → checks `strategyFor !== 'single'` → tries `dispatchToBus`, on any error warns and returns single-LLM fallback. Bus path NEVER becomes a hard requirement — every call site fails open.
+  - `performShunt` — wired inline (not via `maybeDispatch` because of the existing `stripCodeFences` post-processing for `FORMAT_JSON` / `MAKE_ACTIONABLE` / `GENERATE_VAM_PRESET` actions, which the helper signature doesn't accommodate without bloat). Constructs intent as `shunt.${action-slug}`, dispatches when applicable, falls back to single-LLM on error. Bus result reports `tokenUsage: { ..., model: 'bus:<strategy>' }` since per-LLM tokens aren't aggregated server-side.
+- **`hooks/components/settings/Settings.tsx.bak.4`** — deleted (stale backup; the Pattern Z build plan was treated as completed).
+
+**Scope deliberately limited to `performShunt`** — the build plan §6.3 names this as the pilot. The other call sites (`executeModularPrompt`, `gradeOutput`, `generateRawText`, `getMiaChatResponse`) keep the single-LLM path until per-intent dispatch is needed there. `maybeDispatch` is in place as the future wiring helper.
+
+**Behavior summary:**
+
+| Settings | Result |
+|---|---|
+| `patternZEnabled: false` | Identical to pre-change behavior. No bus calls. |
+| `patternZEnabled: true`, aggregator running, Shunt action with non-single strategy | Result comes from the bus (synthesized/voted/picked across @claude + @gemini + @lmstudio peers). |
+| `patternZEnabled: true`, aggregator down | One warn in console, single-LLM fallback fires. User sees normal result. |
+
+**Verification.** `npx tsc --noEmit` clean (only the pre-existing `tools/organize-conversation-history.mjs:684` warning). Live smoke pending operator: Settings → Pattern Z → toggle ON; Shunt → Amplify a sentence; check aggregator stdout for the `/dispatch` log line. With bus down, fallback should fire silently.
+
+**Outstanding Pattern Z work:** wire `maybeDispatch` into `executeModularPrompt` / `gradeOutput` / Weaver / Foundry / Oraculum call sites. Build plan §7.3 sketches this — deferred.

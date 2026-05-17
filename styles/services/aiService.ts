@@ -12,6 +12,110 @@ import { withRetries } from './apiUtils';
 import { aiPlanResponseSchema } from '@/types/schemas';
 import { appEventBus } from '@/lib/eventBus';
 
+// --- Pattern Z bus dispatch -----------------------------------------------
+// When patternZEnabled === true in settings, eligible actions dispatch to the
+// aggregator's /dispatch endpoint (multi-LLM fanout + reduce) instead of
+// calling the single LM Studio endpoint directly. Map of which intents go
+// through the bus (and how) lives in patternZStrategies.ts.
+//
+// The bus path is OPT-IN at the Settings level and FAILS OPEN at the call
+// site — if the aggregator is down or returns an error, callers fall back
+// to the single-LLM path automatically (warns to console).
+
+import { type Strategy, strategyFor } from './patternZStrategies';
+
+const AGGREGATOR_BASE_URL = 'http://127.0.0.1:7780';
+
+export function isPatternZEnabled(): boolean {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_STORAGE_KEY) : null;
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    return s.patternZEnabled === true;
+  } catch {
+    return false;
+  }
+}
+
+function getPatternZStrategy(): Strategy {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_STORAGE_KEY) : null;
+    if (!raw) return 'synthesize';
+    const s = JSON.parse(raw);
+    const v = s.patternZStrategy;
+    return v === 'vote' || v === 'pick-best' || v === 'synthesize' ? v : 'synthesize';
+  } catch {
+    return 'synthesize';
+  }
+}
+
+function getPatternZTimeoutMs(): number {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(SETTINGS_STORAGE_KEY) : null;
+    if (!raw) return 30000;
+    const s = JSON.parse(raw);
+    return typeof s.patternZTimeoutMs === 'number' && s.patternZTimeoutMs > 0 ? s.patternZTimeoutMs : 30000;
+  } catch {
+    return 30000;
+  }
+}
+
+/**
+ * POST to aggregator /dispatch. Returns the joint output text and the per-peer
+ * source candidates. Throws on HTTP error or `{ok:false}` response.
+ */
+export async function dispatchToBus(opts: {
+  intent: string;
+  prompt: string;
+  strategy?: Strategy;
+}): Promise<{ text: string; sources: Array<{ jid: string; reply: string }> }> {
+  const strategy: Strategy = opts.strategy ?? strategyFor(opts.intent, getPatternZStrategy());
+  // 'single' should never reach here — callers check strategy first.
+  if (strategy === 'single') {
+    throw new Error(`dispatchToBus called with strategy='single' for intent='${opts.intent}'`);
+  }
+  const res = await fetch(`${AGGREGATOR_BASE_URL}/dispatch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      intent: opts.intent,
+      prompt: opts.prompt,
+      strategy,
+      timeout_ms: getPatternZTimeoutMs(),
+    }),
+  });
+  if (!res.ok) throw new Error(`Bus dispatch failed: HTTP ${res.status}`);
+  const data: any = await res.json();
+  if (!data?.ok) throw new Error(`Bus dispatch error: ${data?.error ?? 'unknown'}`);
+  return {
+    text: typeof data.joint_output === 'string' ? data.joint_output : '',
+    sources: Array.isArray(data.source_candidates) ? data.source_candidates : [],
+  };
+}
+
+/**
+ * Decide bus vs single-LLM at one call site. Returns the bus result if
+ * dispatch succeeded; otherwise returns the single-LLM fallback. Logs a warn
+ * on bus error but never throws because of bus state — the bus is a
+ * best-effort augmentation, not a hard requirement.
+ */
+async function maybeDispatch(
+  intent: string,
+  buildPrompt: () => string,
+  singleLlmFallback: () => Promise<string>,
+): Promise<string> {
+  if (!isPatternZEnabled()) return singleLlmFallback();
+  const strat = strategyFor(intent, getPatternZStrategy());
+  if (strat === 'single') return singleLlmFallback();
+  try {
+    const { text } = await dispatchToBus({ intent, prompt: buildPrompt(), strategy: strat });
+    return text;
+  } catch (e) {
+    console.warn(`[aiService] Pattern Z dispatch failed (${intent}), falling back to single-LLM:`, e);
+    return singleLlmFallback();
+  }
+}
+
 // --- Cancellation registry ------------------------------------------------
 // All in-flight fetch() calls register their AbortController here. The global
 // Stop button calls cancelAllGenerations() to abort every running call at
@@ -396,6 +500,38 @@ export const performShunt = async (
   promptInjectionGuardEnabled?: boolean,
 ): Promise<{ resultText: string; tokenUsage: TokenUsage }> => {
   try {
+    // Pattern Z dispatch (Phase 5/6) — when patternZEnabled is on AND this
+    // action has a non-'single' strategy, route through the aggregator. The
+    // bus path returns a joint text-only output; token usage is unavailable
+    // for the aggregator path so we report zero usage rather than fabricate.
+    // The intent string mirrors `shunt.<action-slug>` for the strategy map.
+    const shuntIntent = `shunt.${action.toLowerCase().replace(/\s+/g, '-')}`;
+    if (isPatternZEnabled()) {
+      const strat = strategyFor(shuntIntent, getPatternZStrategy());
+      if (strat !== 'single') {
+        try {
+          const { text: joint } = await dispatchToBus({
+            intent: shuntIntent,
+            prompt: getPromptForAction(text, action, context, priority, promptInjectionGuardEnabled),
+            strategy: strat,
+          });
+          const cleaned =
+            action === ShuntAction.FORMAT_JSON ||
+            action === ShuntAction.MAKE_ACTIONABLE ||
+            action === ShuntAction.GENERATE_VAM_PRESET
+              ? stripCodeFences(joint)
+              : joint;
+          return {
+            resultText: cleaned,
+            tokenUsage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, model: `bus:${strat}` },
+          };
+        } catch (e) {
+          console.warn(`[aiService] Pattern Z dispatch failed (${shuntIntent}), falling back to single-LLM:`, e);
+          // fall through to single-LLM path
+        }
+      }
+    }
+
     const apiCall = async () => {
       const prompt = getPromptForAction(text, action, context, priority, promptInjectionGuardEnabled);
       const { text: resultText, usage } = await callChatCompletion({
