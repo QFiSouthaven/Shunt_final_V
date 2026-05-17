@@ -21,6 +21,11 @@ export interface Env {
   // (NOT a secret) configured under [vars] in wrangler.toml. Default empty.
   // Admin gate applies to: PUT /room/:room/schema, kind:'schema-update' envelopes.
   HUB_ADMIN_JIDS: string;
+  // P1 #6 — per-JID token bucket rate limits applied at DO routeEnvelope.
+  // Both optional. Parsed as floats; if unset or unparseable, defaults to
+  // burst=30 envelopes, refill=1.0 envelope/sec. Admin JIDs + '@hub' bypass.
+  RATE_LIMIT_PER_JID_BURST?: string;
+  RATE_LIMIT_PER_JID_REFILL_PER_SEC?: string;
 }
 
 /** Agent JID — convention: "@<name>" (mirrors hub-bus filesystem peers). */

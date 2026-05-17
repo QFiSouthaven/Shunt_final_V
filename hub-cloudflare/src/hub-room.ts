@@ -137,10 +137,21 @@ export class HubRoom implements DurableObject {
     }
 
     const result = await this.routeEnvelope(env);
-    return new Response(JSON.stringify(result), {
-      status: result.ok ? 202 : 400,
-      headers: { 'content-type': 'application/json' },
-    });
+    // P1 #6 — map RATE_LIMITED to HTTP 429 (with Retry-After header in seconds)
+    // so a courteous client can back off correctly. Everything else stays 400.
+    let status: number;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (result.ok) {
+      status = 202;
+    } else if (result.code === 'RATE_LIMITED') {
+      status = 429;
+      if (typeof result.retryAfterMs === 'number') {
+        headers['Retry-After'] = String(Math.max(1, Math.ceil(result.retryAfterMs / 1000)));
+      }
+    } else {
+      status = 400;
+    }
+    return new Response(JSON.stringify(result), { status, headers });
   }
 
   // -------------------------------------------------------------------------
@@ -252,10 +263,31 @@ export class HubRoom implements DurableObject {
     code?: string;
     error?: string;
     delivered?: number;
+    retryAfterMs?: number;
   }> {
     // Drop expired envelopes (absolute expiresAt — s14).
     if (Date.parse(env.expiresAt) <= Date.now()) {
       return { ok: false, code: 'EXPIRED', error: 'envelope past expiresAt' };
+    }
+
+    // P1 #6 — per-JID token bucket rate limit. Cheap consumable check
+    // BEFORE the more expensive admin/schema/typesafe/hop logic. Admin
+    // JIDs and the internal '@hub' sender bypass. Also bypass control-plane
+    // kinds (presence/leave) so a flap doesn't drop their own leave.
+    const isControl = env.kind === 'leave' || env.kind === 'presence';
+    if (!isControl && env.from !== '@hub') {
+      const admins = parseAdminJids(this.env.HUB_ADMIN_JIDS);
+      if (!admins.has(env.from)) {
+        const rl = await this.consumeRateLimit(env.from);
+        if (!rl.allowed) {
+          return {
+            ok: false,
+            code: 'RATE_LIMITED',
+            error: `sender ${env.from} exceeded rate limit; retry in ${Math.ceil(rl.retryAfterMs / 1000)}s`,
+            retryAfterMs: rl.retryAfterMs,
+          };
+        }
+      }
     }
 
     // v0.2 admin gate (P0 audit finding 4.4): Self-Bricking bypass for
@@ -455,6 +487,64 @@ export class HubRoom implements DurableObject {
     const stored = await this.state.storage.get<number>('config:hop_ceiling');
     this.hopCeilingCache = typeof stored === 'number' ? stored : DEFAULT_HOP_CEILING;
     return this.hopCeilingCache;
+  }
+
+  /**
+   * P1 #6 — per-JID token bucket rate limiter (DO-storage backed).
+   *
+   * Reads `ratelimit:<jid>` from DO storage. Refills tokens based on elapsed
+   * time since the last consumption (capped at `burst`), then attempts to
+   * consume one token. Writes the new state back.
+   *
+   * Defaults: burst=30 envelopes, refill=1.0 envelope/sec (i.e. 60/min
+   * sustained, 30-envelope burst). Override via env `RATE_LIMIT_PER_JID_BURST`
+   * and `RATE_LIMIT_PER_JID_REFILL_PER_SEC` (set in wrangler.toml [vars]).
+   *
+   * Note this is per-room (one DO instance per room). A sender looping across
+   * many rooms has separate buckets per room. For a global cap, the Worker
+   * would need a separate shared-state DO; v0.2 chooses the per-room blast
+   * radius reduction as good-enough.
+   */
+  private async consumeRateLimit(jid: string): Promise<{ allowed: boolean; retryAfterMs: number }> {
+    const burst = (() => {
+      const raw = this.env.RATE_LIMIT_PER_JID_BURST;
+      const n = raw ? Number.parseFloat(raw) : NaN;
+      return Number.isFinite(n) && n > 0 ? n : 30;
+    })();
+    const refillPerSec = (() => {
+      const raw = this.env.RATE_LIMIT_PER_JID_REFILL_PER_SEC;
+      const n = raw ? Number.parseFloat(raw) : NaN;
+      return Number.isFinite(n) && n > 0 ? n : 1;
+    })();
+
+    const key = `ratelimit:${jid}`;
+    const now = Date.now();
+    const stored = await this.state.storage.get<{ tokens: number; lastRefillAt: number }>(key);
+    let tokens: number;
+    let lastRefillAt: number;
+    if (stored && typeof stored.tokens === 'number' && typeof stored.lastRefillAt === 'number') {
+      const elapsedSec = Math.max(0, (now - stored.lastRefillAt) / 1000);
+      tokens = Math.min(burst, stored.tokens + elapsedSec * refillPerSec);
+      lastRefillAt = now;
+    } else {
+      // First-time sender: start with a full bucket so legitimate traffic
+      // isn't penalized at the start of a session.
+      tokens = burst;
+      lastRefillAt = now;
+    }
+
+    if (tokens >= 1) {
+      tokens -= 1;
+      await this.state.storage.put(key, { tokens, lastRefillAt });
+      return { allowed: true, retryAfterMs: 0 };
+    }
+    // Tokens < 1. Don't decrement (so the refill timer keeps catching up).
+    // Persist the (rejected) read so a flood doesn't keep re-creating state
+    // from scratch.
+    await this.state.storage.put(key, { tokens, lastRefillAt });
+    const deficit = 1 - tokens;
+    const retryAfterMs = Math.ceil((deficit / refillPerSec) * 1000);
+    return { allowed: false, retryAfterMs };
   }
 
   private safeSend(ws: WebSocket, text: string): void {

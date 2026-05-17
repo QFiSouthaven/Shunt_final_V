@@ -872,3 +872,21 @@ Operator pointed out the receive-side gap: dual-write only POSTs envelopes to th
 - Other P1 hardening items 4–11
 
 **Process note.** Operator surfaced that the project has accumulated 12 plan/runbook/checklist documents across 5 weeks (5,165 lines) and re-planning is masquerading as progress. Saved a session-memory rule: don't write new plan docs; append to BUILD_LOG or just execute. The interrupted `docs/PHASE_B_RUNBOOK.md` was deleted before commit per that rule. `docs/PHASE_A_SMOKE_CHECKLIST.md` was already in the prior commit — leaving it (removing would be more churn), but no successor checklist will be created.
+
+### Phase C — P1 hardening (2026-05-16, ongoing)
+
+Operator greenlit a roll through STATE_SNAPSHOT.md §4 P1 backlog. Atomic commit per item.
+
+#### P1 #6 — per-JID rate limits (Worker)
+
+Single-looped sender could exhaust free-tier ceilings in minutes. Fixed.
+
+- **`hub-cloudflare/src/types.ts`** — `Env` gained two optional vars: `RATE_LIMIT_PER_JID_BURST` (default 30) and `RATE_LIMIT_PER_JID_REFILL_PER_SEC` (default 1.0). Set in `wrangler.toml [vars]` to override.
+- **`hub-cloudflare/src/hub-room.ts`** — new `consumeRateLimit(jid)` method. Per-JID token bucket stored at `ratelimit:<jid>` in DO storage. Refills based on time elapsed since last consume, capped at `burst`. First-time senders start with a full bucket so legitimate traffic isn't penalized at session start. Returns `{ allowed, retryAfterMs }`.
+- **`routeEnvelope`** — calls `consumeRateLimit` BEFORE the more expensive admin/schema/typesafe/hop logic. Bypasses for: `env.from === '@hub'`, admins in `HUB_ADMIN_JIDS`, and control-plane kinds (`leave`, `presence`) so a flap can't drop its own leave.
+- **`handleHttpIngress`** — `RATE_LIMITED` → HTTP 429 with `Retry-After` header (seconds). All other failures still 400.
+- **WS path** — return code propagates through the existing structured-error response on `webSocketMessage`; no separate envelope emitted (the WS sender can already see the structured error).
+
+**Scope deliberately limited.** This is per-room (one DO per room). A sender looping across many rooms has separate buckets per room. For a global cap, a separate shared-state DO is needed — deferred. The per-room cap still reduces blast radius significantly (a flood in one room doesn't poison others).
+
+**Verification.** Worker `npx tsc --noEmit` clean. Live deploy is operator action (`cd hub-cloudflare && npx wrangler deploy`). To verify post-deploy: hammer `/send` from a single JID until 429 appears; check `Retry-After` matches the deficit in seconds.
