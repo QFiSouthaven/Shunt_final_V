@@ -192,13 +192,26 @@ function canonicalJson(value) {
  * Content-addressed envelope id. Same inputs => same id, regardless of clock.
  * Format: 8-4-4-4-12 hex (UUID shape, but it's a SHA-256 truncation).
  *
- * @param {{from:string,to:string,trace?:string|null,replyTo?:string|null,body:any}} fields
+ * P1 #4 — also includes `kind` and `intent` in the canonical input as of
+ * 2026-05-16. Without those, two envelopes with same body+from+to+trace but
+ * different intent collapse to the same id (loses distinct events).
+ * Conversely, retries with body drift used to produce different ids. Including
+ * kind+intent gives the dedupe layer the right granularity.
+ *
+ * This is a one-time discontinuity in id values: pre-2026-05-16 deterministic
+ * ids and post-2026-05-16 deterministic ids will differ for the same logical
+ * envelope. Since the function was exported but not currently called from any
+ * bus tool, the migration impact is internal/external integrators only.
+ *
+ * @param {{from:string,to:string,kind?:string,intent?:string|null,trace?:string|null,replyTo?:string|null,body:any}} fields
  * @returns {string}
  */
-export function computeDeterministicId({ from, to, trace = null, replyTo = null, body }) {
+export function computeDeterministicId({ from, to, kind = '', intent = null, trace = null, replyTo = null, body }) {
   const canonical = canonicalJson({
     from: String(from || ''),
     to: String(to || ''),
+    kind: String(kind || ''),
+    intent: intent == null ? null : String(intent),
     trace: trace == null ? null : String(trace),
     replyTo: replyTo == null ? null : String(replyTo),
     body: body === undefined ? null : body,

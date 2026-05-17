@@ -900,3 +900,13 @@ Hop counters at `trace:<trace>:hops` in DO storage used to leak one row per trac
 - **Memory only** — `lastHopSweepAt` is in-memory; on DO hibernation/wake, the next envelope triggers another sweep, which is the desired behavior.
 
 **Verification.** TS clean. Post-deploy verification: trigger one hop, wait for trace to expire, send another envelope (different trace) to fire a sweep, observe via `wrangler tail` that the trace key disappeared.
+
+#### P1 #4 — deterministic-id includes intent + kind; intent no longer dropped
+
+Two related bugs in one fix.
+
+**Bug A — `computeDeterministicId` in `hub-bus-tools/claim.mjs` hashed only `{from, to, trace, replyTo, body}`.** Same body+from+to+trace with different intent → same id → collapse. Retry with body drift → different id → looks like new event. Fixed by including `kind` and `intent` in the canonical-JSON input. Old/new ids will differ for the same logical envelope; the function was exported but not yet called from any bus tool, so internal impact is zero. External integrators who consumed this need to migrate; noted in the docstring.
+
+**Bug B — `createEnvelope` in `hub-bus-tools/envelope.mjs` silently dropped `intent`.** The destructured params list didn't include intent, so `aggregator.mjs` passing `intent: 'synthesize.candidates'` (and similar) produced envelopes WITHOUT an intent field even though the Worker's Zod validator accepts it. Fixed by accepting intent in the param list and emitting it on the envelope (only when truthy — undefined/null/empty stays omitted so `z.string().optional()` continues to pass).
+
+**Verification.** `node --check` clean on both files. Behavioral: aggregator-originated envelopes will now show `intent` in the transcript. Pre-existing transcript entries are unchanged.

@@ -199,6 +199,7 @@ export async function createEnvelope({
   from,
   to,
   kind,
+  intent,
   body,
   room = '#main',
   replyTo = null,
@@ -238,7 +239,12 @@ export async function createEnvelope({
       ? seq
       : await nextSeq(from, busDir || DEFAULT_BUS_DIR);
 
-  return {
+  // P1 #4 — propagate `intent` if the caller supplied one. Previously this
+  // field was silently dropped by destructuring, even though the Worker
+  // validator accepts and the aggregator passes it. Optional; omitted from
+  // the emitted envelope entirely when not provided (Worker's Zod schema
+  // treats it as `z.string().optional()`).
+  const envelope = {
     id,
     from,
     to,
@@ -254,6 +260,10 @@ export async function createEnvelope({
     sig: sig ?? null,
     issuer: issuer ?? null,
   };
+  if (intent !== undefined && intent !== null && intent !== '') {
+    envelope.intent = String(intent);
+  }
+  return envelope;
 }
 
 /**
