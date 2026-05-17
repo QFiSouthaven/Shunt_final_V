@@ -296,7 +296,17 @@ const STATE = {
 // ---------------------------------------------------------------------------
 
 const BUS_DIR_FOR_PRESENCE = path.resolve(REPO_ROOT, 'hub-bus');
-const PRESENCE_PATH = path.join(BUS_DIR_FOR_PRESENCE, 'presence.json');
+// P1 #3 — per-JID presence files. Each bridge owns presence/<jid>.json;
+// the legacy single presence.json is read-only fallback for migration.
+const PRESENCE_DIR = path.join(BUS_DIR_FOR_PRESENCE, 'presence');
+const LEGACY_PRESENCE_PATH = path.join(BUS_DIR_FOR_PRESENCE, 'presence.json');
+
+/** Mirror of heartbeat.presenceFileNameFor — local copy to avoid an import cycle. */
+function presenceFileNameFor(jid) {
+  const stripped = String(jid || '').replace(/^@/, '');
+  const safe = stripped.replace(/[^A-Za-z0-9_-]/g, '_');
+  return `${safe}.json`;
+}
 
 /** Map a child spec to the JID(s) it owns; empty for non-bridge children. */
 function ownedJidsForSpec(spec) {
@@ -323,27 +333,29 @@ function atomicWriteJsonSync(targetPath, obj) {
 }
 
 function markPresenceOffline(jid, reason) {
-  let presence;
+  // P1 #3 — write to per-JID file. Each writer owns its own filename so the
+  // orchestrator can flip offline without racing the (now-dead) heartbeat.
+  const filePath = path.join(PRESENCE_DIR, presenceFileNameFor(jid));
+  let existing = {};
   try {
-    const raw = fs.readFileSync(PRESENCE_PATH, 'utf8');
-    presence = JSON.parse(raw);
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') existing = parsed;
   } catch {
-    // Presence file missing / malformed — don't synthesize from scratch
-    // (heartbeat owns creation). Skip silently.
-    return false;
+    // No prior per-JID file. Synthesize a minimal one — operators reading
+    // the panel still need to see the offline state even if heartbeat never
+    // got a chance to write.
   }
-  if (!presence || typeof presence !== 'object') return false;
-  if (!presence.agents || typeof presence.agents !== 'object') presence.agents = {};
-  const existing = presence.agents[jid] || {};
-  presence.agents[jid] = {
+  const entry = {
     ...existing,
+    jid,
     online: false,
     offlineReason: reason,
     offlineSince: new Date().toISOString(),
     lastSeenAt: existing.lastSeenAt || new Date().toISOString(),
   };
   try {
-    atomicWriteJsonSync(PRESENCE_PATH, presence);
+    atomicWriteJsonSync(filePath, entry);
     return true;
   } catch {
     return false;

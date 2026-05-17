@@ -60,6 +60,7 @@ hub-bus/dlq/
 hub-bus/transcript.jsonl
 hub-bus/transcript.*.jsonl
 hub-bus/presence.json
+hub-bus/presence/
 hub-bus/.presence.json
 hub-bus/.presence.*
 hub-bus/.seq.*

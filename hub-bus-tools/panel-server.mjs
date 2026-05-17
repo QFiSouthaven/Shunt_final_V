@@ -106,8 +106,28 @@ async function safeReadJson(filePath) {
 }
 
 async function readPresence() {
-  const p = path.join(BUS_DIR, 'presence.json');
-  const data = await safeReadJson(p);
+  // P1 #3 — prefer per-JID files under hub-bus/presence/. Each bridge owns
+  // its own file so heartbeats no longer race. Falls back to the legacy
+  // shared hub-bus/presence.json when no per-JID dir exists yet (fresh
+  // checkout running pre-2026-05-17 heartbeats).
+  const perJidDir = path.join(BUS_DIR, 'presence');
+  try {
+    const entries = await fs.readdir(perJidDir);
+    const agents = {};
+    for (const name of entries) {
+      if (!name.endsWith('.json')) continue;
+      const data = await safeReadJson(path.join(perJidDir, name));
+      if (data && typeof data === 'object' && typeof data.jid === 'string') {
+        agents[data.jid] = data;
+      }
+    }
+    if (Object.keys(agents).length > 0) {
+      return { agents, rooms: {} };
+    }
+  } catch {
+    // Directory missing — fall through to legacy path.
+  }
+  const data = await safeReadJson(path.join(BUS_DIR, 'presence.json'));
   return data || { agents: {}, rooms: {} };
 }
 

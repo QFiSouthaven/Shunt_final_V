@@ -947,3 +947,16 @@ A bridge that exhausts its restart budget previously stayed "online" in `presenc
 - Both PERMANENTLY_FAILED transitions in `ChildSupervisor` (post-exit and the scheduleRestart guard) now invoke `markPresenceOffline` for each owned JID. Post-exit path also emits a red `[orch]` log line.
 
 **Verification.** `node --check` clean. Behavioral: kill a bridge until it exhausts `--max-restarts`; presence.json shows `agents['@<jid>'].online = false` and an `offlineReason: 'permanent_fail'`.
+
+#### P1 #3 — per-JID presence files (kill the merge race)
+
+`heartbeat.mjs` did read-modify-write of the shared `hub-bus/presence.json`. Two bridges heartbeating concurrently could read the same state, both modify, both write — last writer wins and the other's `lastSeenAt` is lost. Fix: each bridge writes its OWN file.
+
+- **`hub-bus-tools/heartbeat.mjs`** — `tickHeartbeat` now writes to `hub-bus/presence/<sanitized-jid>.json` (atomic tmp+rename). Each bridge owns its own filename, so concurrent heartbeats can't clobber each other. New helper `presenceFileNameFor(jid)` strips the leading `@` and replaces anything outside `[A-Za-z0-9_-]` with `_`. A live heartbeat clears stale `offlineReason`/`offlineSince` left by a previous permanent-fail (so a successfully-restarted bridge looks online again).
+- **`hub-bus-tools/orchestrator.mjs`** — `markPresenceOffline` from P1 #9 was also racing the heartbeat by writing the shared file. Now it writes to `presence/<jid>.json` too, owning the same file the heartbeat does (mutually exclusive since the heartbeat is dead by the time orchestrator marks offline). Synthesizes a minimal file if heartbeat never created one.
+- **`hub-bus-tools/panel-server.mjs`** — `readPresence` now prefers the per-JID dir, merges every `<jid>.json` it finds, and falls back to the legacy `presence.json` when no per-JID dir exists yet (so old checkouts keep working through the migration).
+- **`.gitignore`** — added `hub-bus/presence/` (runtime state, same treatment as the inbox/outbox).
+
+**Aggregation semantics.** The shared `presence.json` is no longer authoritative. The panel-server merges per-JID files at read time. A future operator-facing view that needs `{ agents, rooms }` can do the same merge (also documented for `cloud-puller.discoverJids`).
+
+**Verification.** `node --check` clean on all three modified files.
