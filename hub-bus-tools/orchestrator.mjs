@@ -227,6 +227,20 @@ const DEFAULT_CHILDREN = [
     required: false,
     color: 'brightBlue',
   },
+  {
+    // Phase B (2026-05-16) — cross-machine receive. WebSocket-subscribes to
+    // the deployed Worker on behalf of every local-owned JID, writes incoming
+    // envelopes into the local file-bus with skipDualWrite=true. Disabled by
+    // default — opt in with `--enable=cloud-puller` once WORKER_URL and
+    // WORKER_SECRET are exported in the orchestrator's environment. Without
+    // those env vars the daemon exits with code 2 and the supervisor marks
+    // it permanently_failed (no restart loop).
+    name: 'cloud-puller',
+    scriptPath: 'hub-bus-tools/cloud-puller.mjs',
+    enabled: false,
+    required: false,
+    color: 'brightMagenta',
+  },
 ];
 
 /**

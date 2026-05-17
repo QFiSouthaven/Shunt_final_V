@@ -488,8 +488,12 @@ async function dualWriteToWorker(env) {
  * Returns the path of the inbox file written. For broadcast it returns the
  * array of inbox paths written.
  */
-export async function writeEnvelopeToBus(env, busDir) {
+export async function writeEnvelopeToBus(env, busDir, opts = {}) {
   validateEnvelope(env);
+  // Cloud-puller passes { skipDualWrite: true } so envelopes that just arrived
+  // FROM the Worker don't get POSTed back TO the Worker, which would loop
+  // forever. All other callers (bridges, send.mjs, aggregator) leave this off.
+  const skipDualWrite = opts.skipDualWrite === true;
   const inboxRoot = path.join(busDir, 'inbox');
   const outboxDir = path.join(busDir, 'outbox');
   const transcript = path.join(busDir, 'transcript.jsonl');
@@ -524,8 +528,8 @@ export async function writeEnvelopeToBus(env, busDir) {
   // Dual-write to deployed Worker (best-effort; never throws). We await so
   // tests can observe the outcome deterministically; any error inside is
   // already swallowed and logged as a warning, so awaiting cannot break
-  // existing callers.
-  await dualWriteToWorker(env);
+  // existing callers. Cloud-puller passes skipDualWrite=true (see opts).
+  if (!skipDualWrite) await dualWriteToWorker(env);
 
   return inboxPaths;
 }

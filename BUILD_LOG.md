@@ -845,3 +845,30 @@ Updated CLAUDE.md to reflect the new state.
 - Streaming for non-chat call sites (Shunt/Weaver/etc.) — low UX value, defer until requested.
 - The hardcoded "3D-artist + Virt-a-Mate JSON preset" in `analyzeImage` (CLAUDE.md flags it as non-generic) — operator-specific feature; rewrite only if it conflicts with smoke-test goals.
 - Kill the PID-4540 zombie node on :3000 — operator action; documented in earlier 2026-05-15 entry.
+
+### Phase B — Cross-machine hub: cloud-puller (2026-05-16)
+
+Operator pointed out the receive-side gap: dual-write only POSTs envelopes to the Worker; nothing pulls them back into a remote machine's file-bus. Built the missing piece.
+
+- **`hub-bus-tools/cloud-puller.mjs`** (NEW). Opens one WebSocket per local-owned JID to `wss://hub-relay.halkive.workers.dev/ws?room=#main&jid=<jid>&token=<secret>`. Worker tags the connection with `${TAG_JID_PREFIX}<jid>` so any envelope addressed to that JID gets pushed over the WS. Cloud-puller validates each incoming envelope and writes it into the local file-bus via `writeEnvelopeToBus(env, busDir, { skipDualWrite: true })`. Auto-reconnect with exponential backoff (1s → 30s cap, resets after 60s clean uptime). Self-echo suppression (drops envelopes where `from === <subscribedJid>`). Exits cleanly with code 2 if `WORKER_URL` or `WORKER_SECRET` is missing so the orchestrator marks it permanently_failed (no restart loop).
+- **`hub-bus-tools/envelope.mjs`** — `writeEnvelopeToBus(env, busDir, opts)` gained a third `opts.skipDualWrite` param. Cloud-puller passes `true`; all other callers (bridges, send.mjs, aggregator) leave it off. Prevents the obvious loop: A → Worker → B's cloud-puller → B's file-bus → dual-write → Worker → B's cloud-puller → ...
+- **`hub-bus-tools/orchestrator.mjs`** — registered `cloud-puller` in `DEFAULT_CHILDREN` with `enabled: false`. Opt-in via `--enable=cloud-puller`. Uses brightMagenta log color.
+- **Discovery of already-done work:** `STATE_SNAPSHOT.md §7.2` listed "bridges dual-write to Worker" as outstanding. It was already implemented at `envelope.mjs:412` — gated on env vars. Similarly P1 #2 (WS-upgrade KV presence mirror) was already done at `hub-room.ts:109`. Updating STATE_SNAPSHOT.md is a Phase C cleanup task.
+
+**To enable cross-machine on a host:**
+1. Export `WORKER_URL=https://hub-relay.halkive.workers.dev` and `WORKER_SECRET=<HUB_API_SECRET>` in the orchestrator's parent shell.
+2. `npm run bus:stop`, then `node hub-bus-tools/orchestrator.mjs --enable=cloud-puller`.
+3. Verify `curl http://127.0.0.1:7779/status` shows cloud-puller running.
+4. Send a test envelope from another machine; watch local `hub-bus/inbox/<jid>/` for the delivery.
+
+**For aether-shunt-hub Pages deploy** (deferred operator action): `wrangler.toml` is in place with three KV namespace placeholders (`AUDIT_KV`, `AUDIT_FAILURES_KV`, `RATE_LIMIT_KV`). Either use Cloudflare Workers Builds with GitHub integration (recommended; root dir `aether-shunt-hub`, framework Next.js, build `npm install && npm run build`, output `.next`), or install `@cloudflare/next-on-pages` + `wrangler` locally and `wrangler pages deploy`. Either path needs the operator to create the three KV namespaces, fill IDs into wrangler.toml, and set production env vars (`HUB_API_SECRET`, `HUB_ADMIN_JIDS`, `WORKER_URL`).
+
+**Verification.** `node --check` clean on cloud-puller, envelope, orchestrator. Live WS test requires WORKER_SECRET (operator action).
+
+**Not in Phase B (moved to Phase C):**
+- Rate limits in Worker (P1 #6)
+- Hop counter eviction (P1 #1)
+- Per-JID presence files (P1 #3)
+- Other P1 hardening items 4–11
+
+**Process note.** Operator surfaced that the project has accumulated 12 plan/runbook/checklist documents across 5 weeks (5,165 lines) and re-planning is masquerading as progress. Saved a session-memory rule: don't write new plan docs; append to BUILD_LOG or just execute. The interrupted `docs/PHASE_B_RUNBOOK.md` was deleted before commit per that rule. `docs/PHASE_A_SMOKE_CHECKLIST.md` was already in the prior commit — leaving it (removing would be more churn), but no successor checklist will be created.
