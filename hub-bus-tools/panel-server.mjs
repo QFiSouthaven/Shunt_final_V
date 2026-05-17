@@ -27,6 +27,68 @@ const __dirname  = path.dirname(__filename);
 const PORT    = Number(process.env.PANEL_PORT) || 7777;
 const BUS_DIR = process.env.BUS_DIR || path.resolve(__dirname, '..', 'hub-bus');
 
+// P1 #8 — CORS allowlist. Previously the panel echoed `Access-Control-Allow-Origin: *`
+// to every request. With deployment to Pages on the horizon, that's a hole: any
+// site the operator visits could fetch transcript history via XHR.
+//
+// PANEL_ALLOWED_ORIGINS: comma-separated list of explicit origins. Wildcards
+// supported only at the host prefix ("https://*.pages.dev"). Default allows
+// just localhost / 127.0.0.1 on any port (the local dev tooling stack).
+//
+// Set to "*" to restore the legacy open behavior (NOT recommended; only use
+// when proxying through Cloudflare Access or similar).
+const ALLOWED_ORIGIN_PATTERNS = (() => {
+  const raw = (process.env.PANEL_ALLOWED_ORIGINS || '').trim();
+  if (raw === '*') return ['*'];
+  if (!raw) return ['http://localhost:*', 'http://127.0.0.1:*'];
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+})();
+
+function matchesPattern(origin, pattern) {
+  if (pattern === '*') return true;
+  if (pattern === origin) return true;
+  // Wildcard support: `http://localhost:*` or `https://*.pages.dev`.
+  // Build a regex with `*` → `[^/:]*` and escape everything else.
+  const re = new RegExp(
+    '^' +
+      pattern
+        .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*/g, '[^/:]*') +
+      '$',
+  );
+  return re.test(origin);
+}
+
+function isOriginAllowed(origin) {
+  if (!origin) return false;
+  for (const pat of ALLOWED_ORIGIN_PATTERNS) {
+    if (matchesPattern(origin, pat)) return true;
+  }
+  return false;
+}
+
+function corsHeadersFor(reqOrigin) {
+  // If wildcard mode, mirror legacy behavior.
+  if (ALLOWED_ORIGIN_PATTERNS.length === 1 && ALLOWED_ORIGIN_PATTERNS[0] === '*') {
+    return {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Vary': 'Origin',
+    };
+  }
+  if (!isOriginAllowed(reqOrigin)) {
+    // Omit ACAO entirely — browsers will block the response, which is the goal.
+    return { 'Vary': 'Origin' };
+  }
+  return {
+    'Access-Control-Allow-Origin': reqOrigin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin',
+  };
+}
+
 const KNOWN_AGENTS = [
   '@claude', '@claude-code', '@gemini', '@lmstudio',
   '@anythingllm', '@ollama', '@zack',
@@ -129,14 +191,14 @@ async function findEnvelopeById(id) {
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
+  // P1 #8 — CORS headers now origin-aware. The handler stashes the request
+  // origin on `res._reqOrigin` once at entry so we don't need to thread it
+  // through every call site.
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
-    // CORS: open API to AI Studio Build previews and any frontend.
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    ...corsHeadersFor(res._reqOrigin ?? null),
   });
   res.end(body);
 }
@@ -179,13 +241,16 @@ function sendHtml(res, html) {
 async function handle(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const { pathname } = url;
+  // P1 #8 — capture once; stash on res so sendJson can read it without
+  // threading the value through every call site.
+  const reqOrigin = req.headers && typeof req.headers.origin === 'string' ? req.headers.origin : null;
+  res._reqOrigin = reqOrigin;
 
-  // CORS preflight for cross-origin frontends (AI Studio, Cloudflare Pages, etc.).
+  // CORS preflight for cross-origin frontends (Cloudflare Pages console, etc.).
+  // Allowlist defaults to localhost ports; override via PANEL_ALLOWED_ORIGINS.
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      ...corsHeadersFor(reqOrigin),
       'Access-Control-Max-Age': '86400',
     });
     return res.end();

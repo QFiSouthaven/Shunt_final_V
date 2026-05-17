@@ -924,3 +924,15 @@ Fix: relocate both fields under `env._unverified.*`. The new namespace is syntac
 **In-flight envelopes** with top-level `sig`/`issuer` continue to validate — they get auto-namespaced on arrival. No senders need to change before the Worker is redeployed.
 
 **Verification.** Worker `tsc --noEmit` clean. Bus `node --check` clean.
+
+#### P1 #8 — panel CORS lockdown
+
+Panel server emitted `Access-Control-Allow-Origin: *` on every response and preflight. Risk: any web page the operator visits could XHR transcript/inbox/presence data out of `localhost:7777`.
+
+- **`hub-bus-tools/panel-server.mjs`** — `PANEL_ALLOWED_ORIGINS` env var (comma-separated). Default: `http://localhost:*,http://127.0.0.1:*` — covers local dev tooling, blocks public sites. Wildcard support at host prefix only (`https://*.pages.dev`). Set to literal `*` to restore the legacy open behavior (NOT recommended; use only when proxying through Cloudflare Access).
+- `corsHeadersFor(reqOrigin)` decides what to send: full ACAO + methods + headers when the origin matches an allowed pattern, just `Vary: Origin` otherwise (the browser blocks the response when ACAO is absent).
+- Handler stashes the request origin on `res._reqOrigin` once at entry; `sendJson` reads it without needing 19 call-site updates.
+
+**Operator action:** if Cloudflare Pages is in the deploy plan, add `https://aether-shunt-hub.pages.dev` (or the actual Pages URL) to `PANEL_ALLOWED_ORIGINS` in the orchestrator's environment.
+
+**Verification.** `node --check` clean.
