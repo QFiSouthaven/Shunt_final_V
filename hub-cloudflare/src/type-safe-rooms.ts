@@ -171,19 +171,36 @@ function normalizePolicy(value: string): RoomPolicy {
 /**
  * Turn the stored `zod_json` blob into a runtime Zod schema.
  *
- * v0.2 minimal contract: the blob is a small JSON document describing one of
- * a handful of shapes. Two formats are supported so editors can pick whichever
- * is easier to author:
+ * v0.2.2 contract (P1 #11 expansion, 2026-05-17). Each field-def is one of:
  *
- *   A) `{ "$kind": "object", "fields": { "<key>": "<typeName>", ... } }`
- *      where `<typeName>` is one of:
- *        "string" | "number" | "boolean" | "any" | "string?" | "number?" | "boolean?"
- *      Trailing '?' marks the field optional.
+ *   Scalars (short form): `"string" | "number" | "boolean" | "any"`,
+ *     with optional trailing `?` to mark the field optional. Backward-
+ *     compatible with the v0.2 contract.
  *
- *   B) `{ "$kind": "string" | "number" | "boolean" | "any" }` — top-level scalar.
+ *   Object form: `{ "$kind": <kind>, ...refinements }` where `<kind>` is:
  *
- * Anything else (or a parse error) returns `null`, which the loader treats
- * as graceful-off. v0.3 will swap this for a real JSON-Schema → Zod converter.
+ *     - "string"   — refinements: min, max, regex (string), enum (string[])
+ *     - "number"   — refinements: min, max, int (boolean)
+ *     - "boolean"  — no refinements
+ *     - "any"      — no refinements
+ *     - "object"   — required: fields: { <key>: <fieldDef> }
+ *     - "array"    — required: items: <fieldDef>
+ *     - "union"    — required: options: <fieldDef>[]
+ *     - "enum"     — required: values: string[]
+ *     - "record"   — required: value: <fieldDef> (keys are strings)
+ *     - "literal"  — required: value: string | number | boolean
+ *
+ *   On any object form, `"optional": true` marks the field optional.
+ *
+ * Backward-compat: the old `{ $kind: "object", fields: { k: "string" } }`
+ * still works because scalar string short-forms are accepted at any field
+ * position. Top-level scalar `{ "$kind": "string" }` still works.
+ *
+ * v0.3 will swap this for a full JSON-Schema → Zod converter (planned dep:
+ * zod-from-json-schema). Until then this covers ~80% of practical needs.
+ *
+ * Anything unrecognized returns `null`, which the loader treats as
+ * graceful-off.
  */
 function deserializeStoredSchema(zodJson: string): ZodTypeAny | null {
   let parsed: unknown;
@@ -192,27 +209,113 @@ function deserializeStoredSchema(zodJson: string): ZodTypeAny | null {
   } catch {
     return null;
   }
-  if (parsed === null || typeof parsed !== 'object') return null;
-  const obj = parsed as Record<string, unknown>;
+  return buildFieldSchema(parsed);
+}
+
+/** Recursive: turn a single field-def into a ZodTypeAny. Returns null on any malformed input. */
+function buildFieldSchema(def: unknown): ZodTypeAny | null {
+  // Short-form scalar: "string" / "number?" / "any" / etc.
+  if (typeof def === 'string') {
+    return scalarFromName(def);
+  }
+  if (!def || typeof def !== 'object') return null;
+  const obj = def as Record<string, unknown>;
   const kind = obj['$kind'];
+  if (typeof kind !== 'string') return null;
 
-  if (kind === 'object') {
-    const fields = obj['fields'];
-    if (!fields || typeof fields !== 'object') return null;
-    const shape: Record<string, ZodTypeAny> = {};
-    for (const [k, v] of Object.entries(fields as Record<string, unknown>)) {
-      const t = scalarFromName(typeof v === 'string' ? v : '');
-      if (t === null) return null;
-      shape[k] = t;
+  let t: ZodTypeAny | null = null;
+  switch (kind) {
+    case 'string': {
+      let s = z.string();
+      const min = obj['min'];
+      const max = obj['max'];
+      const regex = obj['regex'];
+      const enums = obj['enum'];
+      if (typeof min === 'number') s = s.min(min);
+      if (typeof max === 'number') s = s.max(max);
+      if (typeof regex === 'string') {
+        try { s = s.regex(new RegExp(regex)); } catch { return null; }
+      }
+      if (Array.isArray(enums) && enums.every((v) => typeof v === 'string') && enums.length > 0) {
+        // z.enum requires a non-empty readonly tuple of literal strings.
+        t = z.enum(enums as [string, ...string[]]);
+      } else {
+        t = s;
+      }
+      break;
     }
-    return z.object(shape);
+    case 'number': {
+      let n = z.number();
+      const min = obj['min'];
+      const max = obj['max'];
+      if (typeof min === 'number') n = n.min(min);
+      if (typeof max === 'number') n = n.max(max);
+      if (obj['int'] === true) n = n.int();
+      t = n;
+      break;
+    }
+    case 'boolean':
+      t = z.boolean();
+      break;
+    case 'any':
+      t = z.any();
+      break;
+    case 'object': {
+      const fields = obj['fields'];
+      if (!fields || typeof fields !== 'object') return null;
+      const shape: Record<string, ZodTypeAny> = {};
+      for (const [k, v] of Object.entries(fields as Record<string, unknown>)) {
+        const inner = buildFieldSchema(v);
+        if (inner === null) return null;
+        shape[k] = inner;
+      }
+      t = z.object(shape);
+      break;
+    }
+    case 'array': {
+      const items = buildFieldSchema(obj['items']);
+      if (items === null) return null;
+      t = z.array(items);
+      break;
+    }
+    case 'union': {
+      const opts = obj['options'];
+      if (!Array.isArray(opts) || opts.length < 2) return null;
+      const built: ZodTypeAny[] = [];
+      for (const o of opts) {
+        const inner = buildFieldSchema(o);
+        if (inner === null) return null;
+        built.push(inner);
+      }
+      // z.union expects at least 2 options; cast as the required tuple type.
+      t = z.union(built as [ZodTypeAny, ZodTypeAny, ...ZodTypeAny[]]);
+      break;
+    }
+    case 'enum': {
+      const values = obj['values'];
+      if (!Array.isArray(values) || values.length === 0) return null;
+      if (!values.every((v) => typeof v === 'string')) return null;
+      t = z.enum(values as [string, ...string[]]);
+      break;
+    }
+    case 'record': {
+      const value = buildFieldSchema(obj['value']);
+      if (value === null) return null;
+      t = z.record(z.string(), value);
+      break;
+    }
+    case 'literal': {
+      const value = obj['value'];
+      if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+        return null;
+      }
+      t = z.literal(value);
+      break;
+    }
+    default:
+      return null;
   }
-
-  if (typeof kind === 'string') {
-    return scalarFromName(kind);
-  }
-
-  return null;
+  return obj['optional'] === true ? t.optional() : t;
 }
 
 function scalarFromName(name: string): ZodTypeAny | null {

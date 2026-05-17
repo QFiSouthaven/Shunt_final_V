@@ -979,3 +979,35 @@ npx wrangler deploy
 ```
 
 **Verification.** Worker `tsc --noEmit` clean.
+
+#### P1 #10 — tunnel URL rotation: no code in tree to change
+
+The risk was "panel hardcodes a `cloudflared` quick-tunnel URL → goes stale on restart." Grepping the tree turned up zero hardcoded tunnel URLs (`trycloudflare`, `cloudflared`, `cfargotunnel`, `TUNNEL_URL`) in any `.ts/.mjs/.tsx/.html` file under `hub-bus-tools/`, `hub-bus-panel/`, `hub-bus-panel-desktop/`, `public/`. The Worker is at the stable workers.dev subdomain (`hub-relay.halkive.workers.dev`); the deployed Pages console will be at `aether-shunt-hub.pages.dev` — neither rotates. The original P1 was relevant only if the operator was tunneling the LOCAL `panel-server :7777` via cloudflared; that pattern isn't currently in tree.
+
+**Operator note (if this scenario ever applies):** create a NAMED tunnel via `cloudflared tunnel create <name>`, get the permanent UUID, route DNS via `cloudflared tunnel route dns <name> <hostname>`, and run `cloudflared tunnel --config <cfg.yml> run <name>`. The Cloudflare named-tunnel URL is stable across restarts.
+
+**No code commit for this item.**
+
+#### P1 #11 — Type-Safe Rooms DSL expansion (Task #17)
+
+Previous DSL only handled object-with-primitive-fields. Couldn't express arrays, unions, refinements, nested objects, records, enums. Full JSON-Schema → Zod converter is v0.3 work; this commit expands the hand-rolled DSL to cover ~80% of practical needs without taking on a new dep.
+
+- **`hub-cloudflare/src/type-safe-rooms.ts`** — `deserializeStoredSchema` refactored: replaced the flat switch with a recursive `buildFieldSchema(def)`. New `$kind` values: `array` (with `items`), `union` (with `options[]`, ≥2), `enum` (with `values[]` strings), `record` (string-keyed map of value), `literal` (primitive). Existing kinds gained refinements: `string` accepts `min`/`max`/`regex`/`enum`; `number` accepts `min`/`max`/`int`. Any kind can carry `optional: true`. The old short-form scalar strings (`"string"`, `"number?"`, etc.) still work at any field position — fully backward compatible with v0.2 schemas already stored in D1.
+- The TSR loader/checker (`loadRoomSchema`, `typeSafeCheck`) is unchanged. Self-bricking bypass for `kind:'schema-update'` still load-bearing first check.
+
+**Example expanded schema** (would have been rejected by the v0.2 DSL):
+```json
+{
+  "$kind": "object",
+  "fields": {
+    "title": { "$kind": "string", "min": 1, "max": 200 },
+    "tags": { "$kind": "array", "items": { "$kind": "enum", "values": ["urgent", "draft", "review"] } },
+    "metadata": { "$kind": "record", "value": "any", "optional": true },
+    "priority": { "$kind": "union", "options": ["number", { "$kind": "literal", "value": "auto" }] }
+  }
+}
+```
+
+**Verification.** Worker `tsc --noEmit` clean.
+
+**Still deferred to v0.3:** full JSON-Schema → Zod converter (cross-field refinements, $ref, allOf/anyOf, conditional schemas). The hand-rolled DSL is now expressive enough for the realistic v0.2/v0.3 room schemas we'd write by hand.
