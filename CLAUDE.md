@@ -96,7 +96,7 @@ Single OpenAI-compatible client. All call sites import from here. Public surface
 - `executeModularPrompt`, `gradeOutput`, `synthesizeDocuments`, `generateRawText` — general text generation. `generateRawText` accepts `string | ContentPart[]` (multimodal).
 - `generateRealTimeCorrection`, `generateOraculumInsights`, `generateOrchestratorReport`, `generatePerformanceReport` — specialized text generators.
 - `getAIChatResponseWithContextFlag`, `generateDevelopmentPlan`, `generateCodeFixPlan` — structured-output calls. These use `generateJson(systemPrompt, userPrompt, zodSchema)`, which tries `response_format: { type: 'json_object' }` first and falls back to plain prompt-and-parse if the server rejects `response_format`. Output is Zod-validated before return.
-- `analyzeImage(prompt, { base64Data, mimeType })` — multimodal via OpenAI `image_url` content blocks. Note: this function's prompt template is hardcoded to demand a 3D-artist analysis + Virt-a-Mate JSON preset. It's not generic.
+- `analyzeImage(prompt, { base64Data, mimeType })` — multimodal via OpenAI `image_url` content blocks. The 3D-artist + Virt-a-Mate JSON appendix is keyword-gated (regex matches `vam`, `virt-a-mate`, `3d <model|preset|character|artist|rig>`, `topology`, `pbr`, `rigging`, `morphs`, `uv map`). Generic prompts (e.g. "what's in this image?") get a clean visual-analyst response without the appendix.
 - `startChat(history?)` returns an `AiChat` instance with `.sendMessage({ message })`. Replaces the old Gemini `Chat`. **No streaming yet** — `sendMessage` is single-shot.
 - `getMiaChatResponse`, `getMiaErrorAnalysis`, `generateCodeFixPlan` — Mia-specific helpers (formerly in `miaService.ts`, consolidated here).
 - `isAiConfigured`, `pingAiEndpoint` — diagnostics.

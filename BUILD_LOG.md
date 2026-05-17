@@ -1069,3 +1069,22 @@ Pattern Z Phase 4 (Participants UI in Settings tab) had already been shipped by 
 **Verification.** `npx tsc --noEmit` clean (only the pre-existing `tools/organize-conversation-history.mjs:684` warning). Live smoke pending operator: Settings → Pattern Z → toggle ON; Shunt → Amplify a sentence; check aggregator stdout for the `/dispatch` log line. With bus down, fallback should fire silently.
 
 **Outstanding Pattern Z work:** wire `maybeDispatch` into `executeModularPrompt` / `gradeOutput` / Weaver / Foundry / Oraculum call sites. Build plan §7.3 sketches this — deferred.
+
+### analyzeImage generalized + stale plan-doc cleanup (2026-05-17)
+
+**analyzeImage** — CLAUDE.md flagged the hardcoded "3D-artist + Virt-a-Mate JSON preset" template that fired on every call regardless of what the user actually asked. Two issues fixed in `styles/services/aiService.ts`:
+1. The user's prompt was being appended AFTER the framing instructions, so the model treated the user's question as secondary to the VAM directive. Reversed: user's request now comes first, framing second.
+2. The 3D-artist appendix is now keyword-gated by `VAM_TRIGGER_RE` (matches `vam|virt-a-mate|3d <model|preset|character|artist|rig>|topology|pbr|rigging|morphs|uv map`). Generic prompts ("what's in this image?") get a clean visual-analyst response. Explicit prompts ("generate a VAM preset for this character") still get the full technical appendix.
+
+API signature unchanged. The single caller `hooks/components/image_analysis/ImageAnalysis.tsx` continues to work. CLAUDE.md note updated.
+
+**Stale doc cleanup.** Per the feedback memory's rule about not letting plan docs accumulate, six session-scoped docs deleted in this commit:
+- `UI_NEXT_STEPS.txt` — refs a `UI/` dir that no longer exists (work was migrated into `aether-shunt-hub/`).
+- `docs/AI_STUDIO_HANDOFF.md` — migration to OpenAI-compatible service done; no more `@google/genai` dep.
+- `ADMIN_TERMINAL_KICKOFF_2026-05-13.md` + `_REFRESH.md` — two-Claude-CLI session handoff prompts; work in them is done and the operator pattern is captured in memory (`workflow-two-claude-relay.md`).
+- `CLAUDE_CODE_KICKOFF.md` — older session ephemera.
+- `COWORK_HANDOFF_2026-05-11.md` — session handoff, content absorbed into BUILD_LOG over the last week.
+
+**Kept:** `BUILD_LOG.md` (source of truth), `HANDBOOK.md` (live operator reference), `STATE_SNAPSHOT.md` (stale §3/§4 but useful for cloud-resource IDs), `PATTERN_Z_BUILD_PLAN_2026-05-13.md` (still contains detailed phase save-markers that BUILD_LOG entries reference; operator can delete when comfortable), `docs/PHASE_A_SMOKE_CHECKLIST.md` (operator-facing test list).
+
+Repo plan-doc count: 12 → 6.

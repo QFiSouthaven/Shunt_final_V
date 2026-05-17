@@ -912,31 +912,45 @@ ${projectContext}
   }
 };
 
+// Trigger words that opt into the 3D-artist + Virt-a-Mate-preset technical
+// appendix. CLAUDE.md previously flagged analyzeImage as having a hardcoded
+// VAM preset prompt that fired on every call. As of 2026-05-17 the appendix
+// is keyword-gated so generic image questions get clean responses while the
+// 3D/VAM workflow stays available on explicit ask.
+const VAM_TRIGGER_RE = /\b(vam|virt-?a-?mate|3d ?(model|preset|character|artist|rig)|topology|pbr|rigging|morphs?|uv ?(map|s)?)\b/i;
+
 export const analyzeImage = async (
   prompt: string,
   image: { base64Data: string; mimeType: string },
 ): Promise<{ resultText: string; tokenUsage: TokenUsage }> => {
-  const enhancedPrompt = `
-You are an expert art director and 3D character artist providing a detailed analysis of the attached image.
+  const wantsTechnical3D = VAM_TRIGGER_RE.test(prompt);
 
-First, respond directly and thoroughly to the user's request.
+  const technicalAppendix = `
 
-Then, if the image contains a character, creature, or object suitable for a 3D model, add the following two sections to the end of your analysis, formatted exactly in markdown:
+If the image contains a character, creature, or object suitable for a 3D model, add the following two sections to the end of your analysis, formatted exactly in markdown:
 
-**8. Technical Considerations (for 3D Artists):**
+**Technical Considerations (for 3D Artists):**
 *   **Topology:** Describe the ideal topology for the subject. Emphasize clean, animation-ready quad topology for smooth deformations during rigging and animation.
 *   **UVs:** Detail the necessary UV mapping approach. Specify the need for well-organized, non-overlapping UV maps for all distinct parts of the model (e.g., body, head, hair, clothing).
 *   **Texture Maps:** List the required texture maps for a PBR workflow. Include Diffuse/Albedo, Normal, Roughness, and Specular maps. Mention the benefit of Subsurface Scattering (SSS) maps for any organic surfaces like skin.
 *   **Rigging:** Outline key considerations for rigging. Mention the importance of designing with clear joint placement and weight painting in mind for effective rigging, including the need for facial blend shapes for expressions if applicable.
 
-**9. Virt-a-Mate Preset (JSON):**
+**Virt-a-Mate Preset (JSON):**
 *   **Instructions:** Based on the visual characteristics of the character in the image, generate a complete JSON preset file in the Virt-a-Mate (VAM) format.
 *   **Output:** Your output for this section must be a single, well-formed JSON object inside a JSON markdown block. Do not add any explanatory text outside the JSON.
-*   **Structure:** The JSON should define the character's appearance and properties, emulating the structure of a VAM preset. Include key sections within the main "storables" array for the "geometry" id: "clothing", "hair", "morphs" (this is critical for face/body shape), "textures" (with placeholder URLs like 'author.pack:/path/to/texture.jpg'), and other relevant "storables" for skin, eyes, and physics.
+*   **Structure:** The JSON should define the character's appearance and properties, emulating the structure of a VAM preset. Include key sections within the main "storables" array for the "geometry" id: "clothing", "hair", "morphs" (this is critical for face/body shape), "textures" (with placeholder URLs like 'author.pack:/path/to/texture.jpg'), and other relevant "storables" for skin, eyes, and physics.`;
 
----
-**User's Request:** ${prompt}
-      `;
+  // Generic mode (default): "expert visual analyst" framing, no 3D/VAM bits.
+  // 3D/VAM mode (triggered by keywords in prompt): preserves the original
+  // expert-art-director + technical appendix behavior. Either way the user's
+  // own prompt comes BEFORE the framing, not buried after it — previously the
+  // hardcoded instructions ran first and the user's request was tacked on at
+  // the end, which made the model treat the user's question as secondary.
+  const framing = wantsTechnical3D
+    ? `You are an expert art director and 3D character artist providing a detailed analysis of the attached image. Respond directly and thoroughly to the user's request first.${technicalAppendix}`
+    : `You are an expert visual analyst providing a clear, detailed description of the attached image. Respond directly and thoroughly to the user's request. Don't volunteer technical 3D-pipeline details unless the user asks.`;
+
+  const enhancedPrompt = `**User's Request:** ${prompt}\n\n---\n\n${framing}`;
   try {
     const apiCall = async () => {
       const message: ChatMessage = {
