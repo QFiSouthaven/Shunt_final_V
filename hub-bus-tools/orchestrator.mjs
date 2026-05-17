@@ -287,6 +287,69 @@ const STATE = {
   STOPPED: 'stopped',
 };
 
+// ---------------------------------------------------------------------------
+// P1 #9 — Presence-offline writer for permanently-failed bridges.
+//
+// Without this, a bridge that exhausts its restart budget stays "online" in
+// presence.json forever (the heartbeat that wrote it is gone, but its last
+// stamp remains). Operators reading presence think the bridge is alive.
+// ---------------------------------------------------------------------------
+
+const BUS_DIR_FOR_PRESENCE = path.resolve(REPO_ROOT, 'hub-bus');
+const PRESENCE_PATH = path.join(BUS_DIR_FOR_PRESENCE, 'presence.json');
+
+/** Map a child spec to the JID(s) it owns; empty for non-bridge children. */
+function ownedJidsForSpec(spec) {
+  if (spec.envOverride && typeof spec.envOverride.LMSTUDIO_JID === 'string') {
+    return [spec.envOverride.LMSTUDIO_JID];
+  }
+  switch (spec.name) {
+    case 'claude-bridge':       return ['@claude'];
+    case 'gemini-bridge':       return ['@gemini'];
+    case 'adam-bridge':         return ['@adam'];
+    case 'lmstudio-bridge-default': return ['@lmstudio'];
+    default:                    return [];
+  }
+}
+
+/** Atomic JSON write — write tmp + rename, so a crash mid-write can't half-bake. */
+function atomicWriteJsonSync(targetPath, obj) {
+  const dir = path.dirname(targetPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const base = path.basename(targetPath);
+  const tmp = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.renameSync(tmp, targetPath);
+}
+
+function markPresenceOffline(jid, reason) {
+  let presence;
+  try {
+    const raw = fs.readFileSync(PRESENCE_PATH, 'utf8');
+    presence = JSON.parse(raw);
+  } catch {
+    // Presence file missing / malformed — don't synthesize from scratch
+    // (heartbeat owns creation). Skip silently.
+    return false;
+  }
+  if (!presence || typeof presence !== 'object') return false;
+  if (!presence.agents || typeof presence.agents !== 'object') presence.agents = {};
+  const existing = presence.agents[jid] || {};
+  presence.agents[jid] = {
+    ...existing,
+    online: false,
+    offlineReason: reason,
+    offlineSince: new Date().toISOString(),
+    lastSeenAt: existing.lastSeenAt || new Date().toISOString(),
+  };
+  try {
+    atomicWriteJsonSync(PRESENCE_PATH, presence);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 class ChildSupervisor {
   constructor(spec, opts) {
     this.spec = spec;
@@ -413,6 +476,12 @@ class ChildSupervisor {
         this.log(
           colorize('red', `permanently failed after ${this.restarts} restart(s)`),
         );
+        // P1 #9 — flip each owned JID offline in presence.json so operators
+        // and the panel don't continue showing this bridge as alive.
+        for (const jid of ownedJidsForSpec(this.spec)) {
+          const ok = markPresenceOffline(jid, 'permanent_fail');
+          if (ok) this.log(colorize('red', `presence ${jid} → offline (permanent_fail)`));
+        }
         if (this.spec.required) {
           console.error(
             colorize(
@@ -434,6 +503,11 @@ class ChildSupervisor {
     if (this.shuttingDown) return;
     if (this.restarts >= this.opts.maxRestarts) {
       this.state = STATE.PERMANENTLY_FAILED;
+      // P1 #9 — mirror the post-exit path: ensure presence reflects reality
+      // even when permanent-fail is reached via scheduleRestart guard.
+      for (const jid of ownedJidsForSpec(this.spec)) {
+        markPresenceOffline(jid, 'permanent_fail');
+      }
       return;
     }
     const attempt = this.restarts; // 0-indexed

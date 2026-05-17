@@ -936,3 +936,14 @@ Panel server emitted `Access-Control-Allow-Origin: *` on every response and pref
 **Operator action:** if Cloudflare Pages is in the deploy plan, add `https://aether-shunt-hub.pages.dev` (or the actual Pages URL) to `PANEL_ALLOWED_ORIGINS` in the orchestrator's environment.
 
 **Verification.** `node --check` clean.
+
+#### P1 #9 — orchestrator `permanently_failed` → presence offline
+
+A bridge that exhausts its restart budget previously stayed "online" in `presence.json` forever — the heartbeat that wrote it was gone, but the last stamp remained. Operators reading the panel believed the bridge was alive.
+
+- **`hub-bus-tools/orchestrator.mjs`** — new helpers:
+  - `ownedJidsForSpec(spec)` maps a child spec to JID(s) it owns. Pulls from `envOverride.LMSTUDIO_JID` for the lmstudio-bridge-N variants; falls back to a static map for the named single-JID bridges (`claude-bridge` → `@claude`, etc.). Non-bridge children (aggregator, panel-server, cloud-puller, retry-daemon) return `[]`.
+  - `markPresenceOffline(jid, reason)` reads `presence.json` (sync), sets `{ online:false, offlineReason, offlineSince, lastSeenAt }` for the JID, atomic-writes back. Returns `false` silently if the file is missing/malformed so we don't synthesize one (heartbeat owns creation).
+- Both PERMANENTLY_FAILED transitions in `ChildSupervisor` (post-exit and the scheduleRestart guard) now invoke `markPresenceOffline` for each owned JID. Post-exit path also emits a red `[orch]` log line.
+
+**Verification.** `node --check` clean. Behavioral: kill a bridge until it exhausts `--max-restarts`; presence.json shows `agents['@<jid>'].online = false` and an `offlineReason: 'permanent_fail'`.
