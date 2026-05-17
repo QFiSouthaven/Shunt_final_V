@@ -1120,3 +1120,14 @@ Operator asked for "start bus button on the SPA UI." Honest scope: browsers can'
 **Not in this commit (deferred):** an actual "Start" button that spawns the orchestrator. That requires either a small launcher daemon running at boot (tray app / Windows service / `pm2`-style supervisor) or the operator manually starting once per session. Until then, the copy-command UX is the realistic shape.
 
 **Verification.** `tsc --noEmit` clean.
+
+### One-click launcher `Aether.bat` at repo root (2026-05-17)
+
+Operator asked for "a start script .exe that opens both." Shipped as a `.bat` at repo root — Windows treats it as a double-clickable launcher (functionally identical to `.exe` for this use case; user can pipe through `bat2exe` if they want a real binary).
+
+- **`Aether.bat`** (NEW). Double-click → (1) checks `node_modules`, runs `npm install` if missing; (2) spawns "Aether — Hub Bus" window running `npm run bus:start`; (3) spawns "Aether — SPA" window running `npm run dev`; (4) waits 10s; (5) opens browser to `http://127.0.0.1:3000`.
+- Each spawned window stays open via `cmd /k` so operator sees logs and can Ctrl+C to stop that piece independently. Closing the launcher window doesn't affect the children.
+- Sits at repo root rather than `start/` so it's the front door — first thing alphabetically, first thing the operator sees.
+- `start/start-everything.bat` already existed but launched NEXUS-PRIME + bus + chatroom panel (no SPA). `Aether.bat` is the SPA+bus pair specifically.
+
+**Why not a true `.exe`:** generating a real Windows binary requires external tooling (`bat2exe`, `iexpress`, `ps2exe`, or Node `pkg`) that isn't in this repo's toolchain. The `.bat` behaves identically for the double-click-and-go workflow. Note in the file header points operators to `bat-to-exe.com` if they want a true `.exe` for taskbar pinning.
