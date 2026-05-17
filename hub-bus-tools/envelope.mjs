@@ -257,11 +257,19 @@ export async function createEnvelope({
     ts,
     trace: trace || id,
     capabilities,
-    sig: sig ?? null,
-    issuer: issuer ?? null,
   };
   if (intent !== undefined && intent !== null && intent !== '') {
     envelope.intent = String(intent);
+  }
+  // P1 #7 — emit sig/issuer under `_unverified` namespace so consumers can't
+  // confuse "claim present" with "claim verified". v0.3 will verify and
+  // promote validated values; until then anything reading these MUST read
+  // env._unverified.* and treat the values as untrusted.
+  if ((sig !== undefined && sig !== null) || (issuer !== undefined && issuer !== null)) {
+    envelope._unverified = {
+      ...(sig !== undefined && sig !== null ? { sig: String(sig) } : {}),
+      ...(issuer !== undefined && issuer !== null ? { issuer: String(issuer) } : {}),
+    };
   }
   return envelope;
 }
@@ -317,11 +325,43 @@ export function validateEnvelope(env) {
     }
     env.seq = -1;
   }
-  if (env.sig !== undefined && env.sig !== null && typeof env.sig !== 'string') {
-    throw new Error('validateEnvelope: "sig" must be a string or null');
+  // P1 #7 — sig/issuer live under env._unverified.* (unverified claims
+  // namespace). Validator relocates any legacy top-level fields here so
+  // downstream consumers can't accidentally trust them by reading env.sig.
+  if (env.sig !== undefined || env.issuer !== undefined) {
+    if (env.sig !== undefined && env.sig !== null && typeof env.sig !== 'string') {
+      throw new Error('validateEnvelope: "sig" must be a string or null');
+    }
+    if (env.issuer !== undefined && env.issuer !== null && typeof env.issuer !== 'string') {
+      throw new Error('validateEnvelope: "issuer" must be a string or null');
+    }
+    const existing = (env._unverified && typeof env._unverified === 'object') ? env._unverified : {};
+    env._unverified = {
+      ...existing,
+      ...(env.sig !== undefined && existing.sig === undefined ? { sig: env.sig } : {}),
+      ...(env.issuer !== undefined && existing.issuer === undefined ? { issuer: env.issuer } : {}),
+    };
+    delete env.sig;
+    delete env.issuer;
   }
-  if (env.issuer !== undefined && env.issuer !== null && typeof env.issuer !== 'string') {
-    throw new Error('validateEnvelope: "issuer" must be a string or null');
+  if (env._unverified !== undefined) {
+    if (typeof env._unverified !== 'object' || env._unverified === null) {
+      throw new Error('validateEnvelope: "_unverified" must be an object when present');
+    }
+    if (
+      env._unverified.sig !== undefined &&
+      env._unverified.sig !== null &&
+      typeof env._unverified.sig !== 'string'
+    ) {
+      throw new Error('validateEnvelope: "_unverified.sig" must be a string or null');
+    }
+    if (
+      env._unverified.issuer !== undefined &&
+      env._unverified.issuer !== null &&
+      typeof env._unverified.issuer !== 'string'
+    ) {
+      throw new Error('validateEnvelope: "_unverified.issuer" must be a string or null');
+    }
   }
   return true;
 }

@@ -71,9 +71,16 @@ const EnvelopeShape = z.object({
   // Deprecated: relative TTL in seconds. Tolerated for back-compat with v0.1
   // and v0.2 senders. New writers should set `expiresAt` directly.
   ttl: z.number().int().positive().optional(),
-  // Signature future-proofing — stubbed for v0.2; v0.3 will verify.
-  sig: z.string().nullable().optional(),
-  issuer: z.string().nullable().optional(),
+  // P1 #7 — `sig`/`issuer` claims live under `_unverified` until v0.3 ships
+  // real signature verification. The preprocess step below relocates any
+  // legacy top-level `sig`/`issuer` into this namespace so consumers can't
+  // accidentally trust an unverified claim by reading `env.sig` directly.
+  _unverified: z
+    .object({
+      sig: z.string().nullable().optional(),
+      issuer: z.string().nullable().optional(),
+    })
+    .optional(),
 });
 
 /**
@@ -84,7 +91,9 @@ const EnvelopeShape = z.object({
  */
 export const EnvelopeSchema = z.preprocess((input) => {
   if (!input || typeof input !== 'object') return input;
-  const obj = input as Record<string, unknown>;
+  const obj = { ...(input as Record<string, unknown>) };
+
+  // ttl → expiresAt migration (unchanged).
   if (
     (obj.expiresAt === undefined || obj.expiresAt === null || obj.expiresAt === '') &&
     typeof obj.ttl === 'number' &&
@@ -92,9 +101,26 @@ export const EnvelopeSchema = z.preprocess((input) => {
   ) {
     const base = Date.parse(obj.ts);
     if (!Number.isNaN(base)) {
-      return { ...obj, expiresAt: new Date(base + obj.ttl * 1000).toISOString() };
+      obj.expiresAt = new Date(base + obj.ttl * 1000).toISOString();
     }
   }
+
+  // P1 #7 — relocate legacy top-level `sig`/`issuer` under `_unverified`.
+  // Strip the top-level keys so downstream code can't accidentally trust them.
+  // Pre-existing `_unverified` is preserved and merged (legacy fields lose to
+  // already-namespaced fields if both are present).
+  const hasLegacySig = 'sig' in obj;
+  const hasLegacyIssuer = 'issuer' in obj;
+  if (hasLegacySig || hasLegacyIssuer) {
+    const existing = (obj._unverified && typeof obj._unverified === 'object' ? obj._unverified : {}) as Record<string, unknown>;
+    obj._unverified = {
+      sig: existing.sig ?? (hasLegacySig ? (obj.sig as string | null | undefined) ?? null : undefined),
+      issuer: existing.issuer ?? (hasLegacyIssuer ? (obj.issuer as string | null | undefined) ?? null : undefined),
+    };
+    delete obj.sig;
+    delete obj.issuer;
+  }
+
   return obj;
 }, EnvelopeShape);
 

@@ -910,3 +910,17 @@ Two related bugs in one fix.
 **Bug B — `createEnvelope` in `hub-bus-tools/envelope.mjs` silently dropped `intent`.** The destructured params list didn't include intent, so `aggregator.mjs` passing `intent: 'synthesize.candidates'` (and similar) produced envelopes WITHOUT an intent field even though the Worker's Zod validator accepts it. Fixed by accepting intent in the param list and emitting it on the envelope (only when truthy — undefined/null/empty stays omitted so `z.string().optional()` continues to pass).
 
 **Verification.** `node --check` clean on both files. Behavioral: aggregator-originated envelopes will now show `intent` in the transcript. Pre-existing transcript entries are unchanged.
+
+#### P1 #7 — sig/issuer namespaced under `_unverified`
+
+Previously: `sig` and `issuer` were top-level optional fields. Anything reading `env.sig` got a value (or null) and could plausibly believe it was verified. v0.3 hasn't shipped verification yet, so every consumer reading those fields was relying on unverified claims as if they were trusted.
+
+Fix: relocate both fields under `env._unverified.*`. The new namespace is syntactic friction against the mistake — there's no way to write `env._unverified.sig` and believe the value is verified.
+
+- **`hub-cloudflare/src/envelope.ts`** — `EnvelopeShape` drops top-level `sig`/`issuer`, adds optional `_unverified: { sig?, issuer? }`. The preprocess step now also relocates any legacy top-level `sig`/`issuer` into `_unverified` and deletes the top-level keys. Existing `_unverified` is preserved if present (and wins over legacy fields when both exist).
+- **`hub-cloudflare/src/transcript.ts`** — D1 inserts now read `env._unverified?.sig` / `env._unverified?.issuer`. D1 column names stay `signature`/`issuer` for back-compat with `migrations/0003_envelope_metadata.sql`.
+- **`hub-bus-tools/envelope.mjs`** — `validateEnvelope` mirrors the Worker preprocess: relocates legacy top-level fields, type-checks the `_unverified` shape. `createEnvelope` emits `_unverified` when either field is provided; never emits top-level sig/issuer.
+
+**In-flight envelopes** with top-level `sig`/`issuer` continue to validate — they get auto-namespaced on arrival. No senders need to change before the Worker is redeployed.
+
+**Verification.** Worker `tsc --noEmit` clean. Bus `node --check` clean.

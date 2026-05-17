@@ -49,9 +49,12 @@ export async function recordEnvelope(
         env.trace,
         env.seq,
         typeof env.body === 'string' ? env.body : JSON.stringify(env.body),
-        env.sig ?? null,
+        // P1 #7 — sig/issuer are now under env._unverified.* (unverified claims
+        // namespace). The D1 column names stay `signature`/`issuer` for back-compat
+        // with the migration SQL; only the source-of-truth field path changed.
+        env._unverified?.sig ?? null,
         expiresAt,
-        env.issuer ?? null,
+        env._unverified?.issuer ?? null,
       )
       .run();
   } catch (err) {
