@@ -223,7 +223,7 @@ async function dispatch({ intent, prompt, fanout_jids, strategy, timeout_ms }) {
       const filePath = entry?.path || entry?.filePath || entry?.__path;
       if (!env || !requestIds.includes(env.replyTo)) continue;
       if (replies.has(env.from)) continue;
-      const text = typeof env.body === 'string' ? env.body : JSON.stringify(env.body);
+      const text = stripThinkBlocks(typeof env.body === 'string' ? env.body : JSON.stringify(env.body));
       replies.set(env.from, text);
       if (filePath) {
         try {
@@ -275,6 +275,20 @@ function pickMostCommon(candidates) {
   return pickLongestCoherent(candidates);
 }
 
+// Strip <think>...</think> reasoning blocks that local reasoning models
+// (qwen3 etc.) emit before their actual answer. Without this, the
+// pick-best strategy (longest-wins) selects raw thinking dumps over
+// correct concise answers, and the synthesizer wastes context on them.
+// Unclosed <think> (truncated stream) drops everything from the tag on.
+function stripThinkBlocks(text) {
+  if (typeof text !== 'string' || text.indexOf('<think>') === -1) return text;
+  let out = text.replace(/<think>[\s\S]*?<\/think>/g, '');
+  const open = out.indexOf('<think>');
+  if (open !== -1) out = out.slice(0, open);
+  out = out.trim();
+  return out.length > 0 ? out : text.trim();
+}
+
 function pickLongestCoherent(candidates) {
   return candidates.reduce((a, b) =>
     (b.reply || '').length > (a.reply || '').length ? b : a,
@@ -322,7 +336,7 @@ async function synthesizeViaPeer(candidates, originalPrompt) {
       const r = entry?.envelope || entry?.data || entry;
       const fp = entry?.path || entry?.filePath || entry?.__path;
       if (r?.replyTo === env.id) {
-        const text = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+        const text = stripThinkBlocks(typeof r.body === 'string' ? r.body : JSON.stringify(r.body));
         if (fp) {
           try {
             await releaseEnvelope(fp, 'done');

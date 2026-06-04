@@ -1135,3 +1135,45 @@ Operator asked for "a start script .exe that opens both." Shipped as a `.bat` at
 ### Dev-server restart (2026-05-18)
 
 Vite dev server was down; operator asked for a background restart. Ports :3000 and :3001 both free at check (PID 4540 zombie from earlier sessions had already died — likely killed via admin shell or reboot). Started `npm run dev` as a background job; Vite came up on canonical **http://127.0.0.1:3000/** in 457 ms; `curl` returned HTTP 200 (1168 bytes, TTFB 40 ms). No source touched.
+
+### Installer wrapper authored; build blocked on GH Actions billing (2026-06-04)
+
+Operator returned after 17 days of dormancy. Explicit ask: "I want to use this like a normal program you buy from the store..install it and start using the thing...not a developers playground with terminal logic." End-state goal: double-click `.exe`, store-bought install feel, no terminal at any step.
+
+**What landed in tree (commit `4173561`):**
+
+- **`aether-app/`** — Electron + electron-builder NSIS wrapper. Mirrors the proven `hub-bus-panel-desktop/` pattern but wraps the full SPA, not just the splicer.
+  - `main.js`: single-instance lock; `app.isPackaged`-aware path resolution; stages `hub-bus-tools/` from `process.resourcesPath` to `%APPDATA%/Aether Shunt/hub-bus-tools/` on every launch (versioned via `bus-stage.version`) so the orchestrator can write to its own `__dirname`-relative paths under a writable dir; spawns orchestrator via `ELECTRON_RUN_AS_NODE` with `windowsHide: true` + piped stdio to `bus.log` (zero CMD window flash); tray with Show/Hide/Open data folder/Open bus log/Quit; close-to-tray; IPC surface for the wizard.
+  - `preload.js`: `contextBridge` exposes `window.aether.{probeLmStudio, saveSecret, hasSecret, saveSettingsSeed, readSettingsSeed, completeFirstRun, openExternal, getVersion, getBusStatus, restartBus}`. Auto-seeds the SPA's `localStorage['ai-shunt-settings']` from the saved seed on every load — the user never sees the Settings tab.
+  - `first-run.html`: three-step wizard. Step 1: tick boxes for LM Studio / Anthropic / OpenAI (LM Studio probed live via `:1234/v1/models`, status pill). Step 2: paste API keys for the cloud backends ticked; keys stored via Electron `safeStorage` (DPAPI-encrypted). Step 3: confirm and launch the SPA with Pattern Z forced ON.
+  - `package.json` electron-builder config: per-user NSIS install (no admin), Start Menu + desktop shortcuts, artifact name `Aether-Shunt-Setup-${version}.${ext}`, extraResources bundles SPA `dist/` and bus tools.
+  - `gen-icon.cjs`: generates a placeholder `tray-icon.png` (32×32 flat #1f3a5e square with #58a6ff border). Real artwork pending.
+- **`.github/workflows/build-installer.yml`** — `windows-latest` runner, Node 20, `npm install` in root, `npx vite build --base=./` (critical: `--base=./` makes `dist/` references file://-loadable), `npm install` in `aether-app/`, `npm run dist`. Artifact upload + Release attachment on tag push.
+- **`INSTALL.md`** at repo root — click-by-click for the operator (GitHub Desktop → push → Actions tab → download artifact → run installer). Currently outdated because GH Actions never produced an artifact.
+
+**Verification done before push:**
+
+- `node --check` clean on all three wrapper JS files.
+- Real `npx vite build --base=./` run against a sandbox copy of the SPA source: 35 chunks, 410 KB main bundle, `dist/index.html` references assets via `./assets/*` (verified file://-loadable; favicon stays absolute but Electron uses `tray-icon.png` for the window icon so it's invisible).
+- Workflow YAML parses valid via `yaml.safe_load`.
+- All bus tools confirmed present including `lms-instances.json`.
+
+**Push mechanics worth recording:**
+
+- Sandbox couldn't remove `.git/index.lock` (Windows-owned permission). Worked around with `GIT_INDEX_FILE=/tmp/aether-index` for staging + commit. Commit `4173561` advanced `refs/heads/main` correctly; the regular `.git/index` stayed in its pre-commit state, which makes Git GUI's "Staged Changes" pane look confused. **Cosmetic only** — `git push` works because HEAD is what's pushed, not the index.
+- Push performed via Git GUI from computer-use (operator has no GitHub Desktop; the installed apps list showed `Git GUI`, which is the Tcl/Tk `wish.exe` shell). Push log: `e1c1991..4173561  main -> main`, "Success".
+
+**Outcome:**
+
+GH Actions run #1 failed in 3 seconds with **`The job was not started because your account is locked due to a billing issue.`** Account-level lock, not a workflow defect. The `.exe` was never produced. Operator's response: *"forget the .exe"* — installer path shelved.
+
+**Operator-side resolution (when revisited):**
+
+1. `github.com/settings/billing/summary` → `Spending limits`. Most likely cause: spending limit at $0 blocking private-repo Actions minutes.
+2. Alternative: change `Shunt_final_V` repo visibility to public. Public repos get unlimited Action minutes on the Free plan; no payment method required.
+3. After unlock, click "Re-run jobs" on workflow run #1 — no re-push needed; the existing commit already triggers the workflow.
+
+**Lessons captured:**
+
+- Wrap-not-rebuild: reusing the splicer-desktop Electron pattern saved 70%+ of the wrapper code. Don't author new Electron mains when a proven one already exists in tree.
+- "St

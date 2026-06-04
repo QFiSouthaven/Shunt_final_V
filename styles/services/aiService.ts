@@ -63,6 +63,10 @@ function getPatternZTimeoutMs(): number {
 /**
  * POST to aggregator /dispatch. Returns the joint output text and the per-peer
  * source candidates. Throws on HTTP error or `{ok:false}` response.
+ *
+ * ⚠ DO NOT bypass `isPatternZEnabled()` checks at call sites.
+ * Existing call sites must remain single-LLM compatible when the toggle is off.
+ * See PATTERN_Z_BUILD_PLAN §6 and §7 for the strategy map.
  */
 export async function dispatchToBus(opts: {
   intent: string;
@@ -99,6 +103,11 @@ export async function dispatchToBus(opts: {
  * on bus error but never throws because of bus state — the bus is a
  * best-effort augmentation, not a hard requirement.
  */
+/** Zero-usage TokenUsage for the bus path (per-LLM tokens aren't aggregated server-side). */
+function busTokenUsage(strat: Strategy): TokenUsage {
+  return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, model: `bus:${strat}` };
+}
+
 async function maybeDispatch(
   intent: string,
   buildPrompt: () => string,
@@ -523,7 +532,7 @@ export const performShunt = async (
               : joint;
           return {
             resultText: cleaned,
-            tokenUsage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, model: `bus:${strat}` },
+            tokenUsage: busTokenUsage(strat),
           };
         } catch (e) {
           console.warn(`[aiService] Pattern Z dispatch failed (${shuntIntent}), falling back to single-LLM:`, e);
@@ -563,6 +572,18 @@ export const executeModularPrompt = async (
 ): Promise<{ resultText: string; tokenUsage: TokenUsage }> => {
   const prompt = constructModularPrompt(text, modules, context, priority, promptInjectionGuardEnabled);
   try {
+    // Pattern Z (§7.3): modular pipeline output benefits from multi-LLM synthesis.
+    if (isPatternZEnabled()) {
+      const strat = strategyFor('shunt.modular', getPatternZStrategy());
+      if (strat !== 'single') {
+        try {
+          const { text: joint } = await dispatchToBus({ intent: 'shunt.modular', prompt, strategy: strat });
+          return { resultText: joint, tokenUsage: busTokenUsage(strat) };
+        } catch (e) {
+          console.warn('[aiService] Pattern Z dispatch failed (shunt.modular), falling back to single-LLM:', e);
+        }
+      }
+    }
     const apiCall = async () => {
       const { text: resultText, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
@@ -588,6 +609,9 @@ ${originalPrompt}
 --- AI OUTPUT TO GRADE ---
 ${output}
 `;
+  // Pattern Z (§7.3): deliberately NOT bus-dispatched. The caller parses the
+  // strict "Score: N" format at temperature 0; multi-LLM synthesis can't
+  // guarantee that contract. Strategy map pins 'shunt.grade' to 'single'.
   try {
     const apiCall = async () => {
       const { text } = await callChatCompletion({
@@ -617,6 +641,19 @@ ${combinedContent}
 ---
 `;
   try {
+    // Pattern Z (§7.3): document synthesis is the natural fanout case —
+    // each peer merges independently, the synthesizer reconciles.
+    if (isPatternZEnabled()) {
+      const strat = strategyFor('shunt.synthesize-docs', getPatternZStrategy());
+      if (strat !== 'single') {
+        try {
+          const { text: joint } = await dispatchToBus({ intent: 'shunt.synthesize-docs', prompt, strategy: strat });
+          return { resultText: joint, tokenUsage: busTokenUsage(strat) };
+        } catch (e) {
+          console.warn('[aiService] Pattern Z dispatch failed (shunt.synthesize-docs), falling back to single-LLM:', e);
+        }
+      }
+    }
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [{ role: 'user', content: prompt }],
@@ -634,8 +671,23 @@ ${combinedContent}
 export const generateRawText = async (
   prompt: string | ContentPart[],
   modelName?: string,
+  intent?: string,
 ): Promise<{ resultText: string; tokenUsage: TokenUsage }> => {
   try {
+    // Pattern Z (§7.3): generic text generation dispatches only when the
+    // caller declares an intent AND the prompt is plain text. Multimodal
+    // ContentPart[] prompts always stay single-LLM (the bus is text-only).
+    if (intent && typeof prompt === 'string' && isPatternZEnabled()) {
+      const strat = strategyFor(intent, getPatternZStrategy());
+      if (strat !== 'single') {
+        try {
+          const { text: joint } = await dispatchToBus({ intent, prompt, strategy: strat });
+          return { resultText: joint, tokenUsage: busTokenUsage(strat) };
+        } catch (e) {
+          console.warn(`[aiService] Pattern Z dispatch failed (${intent}), falling back to single-LLM:`, e);
+        }
+      }
+    }
     const apiCall = async () => {
       const { text, usage } = await callChatCompletion({
         messages: [buildUserMessage(prompt)],
@@ -712,7 +764,8 @@ ${eventsJson}
       });
       return text;
     };
-    return await withRetries(apiCall);
+    // Pattern Z (§7.3): telemetry insight reports synthesize well across peers.
+    return await maybeDispatch('oraculum.insights', () => prompt, () => withRetries(apiCall));
   } catch (error) {
     logFrontendError(error, ErrorSeverity.High, { context: 'generateOraculumInsights AI call' });
     throw error;

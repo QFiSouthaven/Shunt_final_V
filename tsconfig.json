@@ -25,4 +25,14 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   }
+  ,
+  "exclude": [
+    "node_modules",
+    "dist",
+    "aether-app",
+    "aether-shunt-hub",
+    "cockpit---systems-operations-console",
+    "hub-bus-panel-desktop",
+    "hub-cloudflare"
+  ]
 }

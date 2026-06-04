@@ -15,18 +15,18 @@ export const useJobManager = () => {
     jobsRef.current = jobs;
 
     const updateJob = (jobId: string, updates: Partial<Job>) => {
-        setJobs(prevJobs => prevJobs.map(job => 
+        setJobs(prevJobs => prevJobs.map(job =>
             job.id === jobId ? { ...job, ...updates } : job
         ));
     };
 
     const addLog = (jobId: string, message: string) => {
         const newLog: JobLog = { timestamp: new Date().toLocaleTimeString(), message };
-        setJobs(prevJobs => prevJobs.map(job => 
+        setJobs(prevJobs => prevJobs.map(job =>
             job.id === jobId ? { ...job, logs: [...job.logs, newLog] } : job
         ));
     };
-    
+
     const isJobCancelled = (jobId: string): boolean => {
         const job = jobsRef.current.find(j => j.id === jobId);
         return job?.status === 'Cancelled';
@@ -55,7 +55,7 @@ export const useJobManager = () => {
             await sleep(1500);
 
             if (isJobCancelled(newJob.id)) throw new Error('Job cancelled by user.');
-            
+
             updateJob(newJob.id, { status: 'Running' });
             addLog(newJob.id, 'AI worker picked up the job. Preparing to execute...');
             await sleep(1000);
@@ -63,7 +63,7 @@ export const useJobManager = () => {
             if (isJobCancelled(newJob.id)) throw new Error('Job cancelled by user.');
 
             addLog(newJob.id, 'Contacting AI model for analysis...');
-            
+
             let promptContent: string | ContentPart[];
             let textPrompt: string;
 
@@ -87,7 +87,9 @@ export const useJobManager = () => {
                 promptContent = textPrompt;
             }
 
-            const { resultText } = await generateRawText(promptContent, '');
+            // Pattern Z: plan-generation jobs dispatch as weaver.outline when the
+            // prompt is plain text; multimodal jobs stay single-LLM automatically.
+            const { resultText } = await generateRawText(promptContent, '', 'weaver.outline');
 
             if (isJobCancelled(newJob.id)) throw new Error('Job cancelled by user.');
 
@@ -102,10 +104,10 @@ export const useJobManager = () => {
         } catch (error) {
             const message = error instanceof Error ? error.message : 'An unknown error occurred.';
             const isCancelled = message.includes('cancelled');
-            updateJob(newJob.id, { 
-                status: isCancelled ? 'Cancelled' : 'Failed', 
-                result: isCancelled ? 'Job execution was cancelled by the user.' : message, 
-                endTime: Date.now() 
+            updateJob(newJob.id, {
+                status: isCancelled ? 'Cancelled' : 'Failed',
+                result: isCancelled ? 'Job execution was cancelled by the user.' : message,
+                endTime: Date.now()
             });
             addLog(newJob.id, isCancelled ? 'Execution halted by user.' : `Job failed: ${message}`);
         } finally {

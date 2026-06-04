@@ -63,6 +63,8 @@ SettingsProvider
 
 ### Top-level layout
 
+- `aether-app/` — Electron + electron-builder NSIS wrapper for the SPA + bus. Authored 2026-06-04. Mirrors the `hub-bus-panel-desktop/` pattern but wraps the whole product. First-run wizard auto-seeds `localStorage['ai-shunt-settings']` so users never see the Settings tab. Bus orchestrator spawned hidden via `ELECTRON_RUN_AS_NODE` + `windowsHide: true`. Build is GH-Actions-only (no local cross-build); current GH Actions runs are blocked by an account-level billing lock — see `docs/SESSION_2026-06-04_HANDOFF.md`.
+- `.github/workflows/build-installer.yml` — Windows-runner CI that produces `Aether-Shunt-Setup-<ver>.exe`. **Critical:** uses `npx vite build --base=./`; absolute base breaks Electron's `file://` loading.
 - `App.tsx`, `index.tsx`, `index.html` — entry. `index.html` is **not** a typical CRA shell: it loads Tailwind, ReactFlow CSS, Pyodide, and Mermaid from CDNs, and contains an inline self-heal protocol that POSTs to the user's configured AI endpoint when `window.onerror` catches a module-resolution failure. Treat the inline script as part of the runtime contract.
 - `hooks/` — confusingly, this is **not just React hooks**. It also holds nearly all UI components under `hooks/components/` (Mission Control, Mia, Shunt, Weaver, Foundry, Chat, Oraculum, Chronicle, settings, etc.), plus standalone hooks (`useShuntProcessor`, `useJobManager`, `useValidation`, etc.). Convention: place new components under `hooks/components/<feature>/`.
 - `styles/services/` — despite the name, this holds business logic and React contexts, not styles. Includes `aiService.ts`, `telemetry.ts`, `telemetry.service.ts`, `versionControl.service.ts`, `codeExecutor.ts` (Pyodide), `diagramService.ts`, `governanceApi.ts`, `prompts.ts`, etc., plus the entire `styles/services/context/` directory of React Contexts.
@@ -105,33 +107,19 @@ Single OpenAI-compatible client. All call sites import from here. Public surface
 
 `resolveModel(requested?)` ignores any model name matching `^gemini[-/]/i` (legacy migration safeguard) and falls back to the configured `aiModel`. Pass `''` (empty string) at call sites to use the configured model.
 
+### Pattern Z (multi-LLM collaborative output)
+
+Pattern Z is the product's multi-AI mode: eligible actions fan out to several LLMs over the file-bus, an aggregator reduces the candidates, and the user sees one joint output. **It is opt-in and fails open** — with the Settings toggle off, or with the aggregator down, every call site behaves exactly like the single-LLM path.
+
+- **Toggle & settings** — Settings → Pattern Z panel (`hooks/components/settings/PatternZPanel.tsx`). `patternZEnabled` / `patternZStrategy` / `patternZTimeoutMs` live in the same `ai-shunt-settings` localStorage key as the AI provider config.
+- **Aggregator** — `hub-bus-tools/aggregator.mjs`, loopback HTTP on `:7780`, runs as an orchestrator child. Endpoints: `POST /dispatch` (fan-out + reduce), `GET/PUT /participants` (owns `hub-bus/participants.json`, reconciles bridges via the orchestrator admin face on `:7779`), `GET /lmstudio-models` (CORS proxy), `GET /healthz`.
+- **Strategy map** — `styles/services/patternZStrategies.ts`. Per-intent defaults (`synthesize` / `pick-best` / `vote` / `single`); `single` bypasses the bus entirely. Format-sensitive intents (`shunt.grade`, `imageAnalysis.preset`) are pinned `single` — do not flip them to a bus strategy without fixing the callers' output parsing first.
+- **Dispatch call sites** — `performShunt`, `executeModularPrompt`, `synthesizeDocuments`, `generateOraculumInsights`, and `generateRawText` (only when the caller passes an `intent` and the prompt is a plain string; multimodal `ContentPart[]` never buses). Foundry/Weaver pass intents (`foundry.audit|feedback|refine`, `weaver.outline`) through `generateRawText`'s third arg. Bus results report `tokenUsage.model = 'bus:<strategy>'` with zero token counts.
+- **Pair daemon** — `hub-bus-tools/claude-pair-daemon.mjs` runs the two-Claude Architect/Executor loop for autonomous builds. Operator-launched only; deliberately NOT an orchestrator child.
+- **Rails:** never bypass `isPatternZEnabled()` at a call site; never make the bus a hard dependency (always keep the single-LLM fallback); aggregator binding stays loopback-only unless bearer auth is added first.
+
 ### Identity & telemetry
 
 User and session IDs are minted in `App.tsx` (uuid v4, persisted to `localStorage`/`sessionStorage`) and seeded into `TelemetryProvider` as `GlobalTelemetryContext`. Telemetry init runs once from `index.tsx`.
 
-Telemetry is consolidated into `styles/services/telemetry.service.ts` (class-based, used by `TelemetryContext`). The old module-scoped `telemetry.ts` has been removed. (Update 2026-05: consolidation completed; this paragraph previously documented the duplicate.)
-
-### Error handling & self-healing
-
-- `setupGlobalErrorHandlers()` wired at startup.
-- `index.html` inline script catches `window.onerror` and triggers a recovery overlay only on module-resolution failures (`Failed to resolve module specifier`, `Failed to fetch dynamically imported module`, `Importing a module script failed`, `blocked by a null value`). Recovery posts the error to the user's AI endpoint with `response_format: json_object` and asks for a fix plan.
-- `MiaContext` exposes `diagnoseLastError`, `generateFixAttempt`, `applyFix` for in-app diagnosis. **No mutex** — overlapping calls can clobber `activePlan`.
-
-## Conventions
-
-- **No relative climbs across top-level dirs.** Use the `@/...` alias.
-- **Lazy-load heavy tabs/features** following the MissionControl pattern.
-- **All AI calls go through `aiService.ts`.** Never instantiate a vendor SDK or call `fetch` to an AI endpoint directly. Never reintroduce `@google/genai` or any other vendor SDK.
-- **Pass `''` for model parameters at call sites.** `resolveModel` will use the user's configured model. Hardcoded vendor model names (e.g., `'gemini-2.5-flash'`, `'gpt-4'`) will be ignored or cause confusion.
-- **Provider order in `App.tsx` is load-bearing.** New contexts that depend on Settings/Telemetry/MCP/Mailbox/Mia must nest inside, not above them.
-- **Structured output uses Zod.** Define the schema in `types/schemas.ts`, pass to `generateJson` or use one of the typed wrappers.
-- **Multimodal:** when building `ContentPart[]`, use `{ text }` and `{ inlineData: { data, mimeType } }`. `aiService` collapses to plain string content when no image part is present (some text-only OpenAI-compatible servers reject array-form content).
-- **Do not respond with multiple answers or solutions that funnel down to the same answer.** If the options converge on the same conclusion, pick one and commit. Parallel choices are only useful when the paths and outcomes are genuinely distinct — otherwise they pad the response and signal indecision. Applies to strategy questions, design tradeoffs, and fire-word dispatch alike.
-
-## Reference docs (read-only)
-
-- `security.md` — historical analysis of Google AI Studio's "Build" agent. **Not** a security policy for this repo. Keep as architectural context for the prompt-engineering choices in `prompts.ts`.
-- `migrated_prompt_history/` — frozen artifacts from the AI Studio migration. Not loaded at runtime.
-- `prompts/system/*.md` — reference prompts; not loaded at runtime.
-- `BUILD_LOG.md` — append-only build journal. Read this for context on hub-bus and Worker decisions.
-- `HANDBOOK.md`, `STATE_SNAPSHOT.md` — operator onboarding and current-state snapshots.
+Telemetry is consolidated into `styles/services/telemetry

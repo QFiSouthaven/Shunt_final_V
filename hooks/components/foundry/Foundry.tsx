@@ -69,7 +69,7 @@ const Foundry: React.FC = () => {
     const updateAgentState = (name: AgentName, updates: Partial<FoundryAgent>) => {
         setAgents(prev => prev.map(a => a.name === name ? { ...a, ...updates } : a));
     };
-    
+
     const parseScoreFromResult = (text: string): { content: string, score: number } => {
         const scoreMatch = text.match(/SCORE:\s*(\d+)/);
         const score = scoreMatch ? parseInt(scoreMatch[1], 10) : Math.floor(Math.random() * 10) + 75; // Fallback score
@@ -89,7 +89,7 @@ const Foundry: React.FC = () => {
         setLog([]);
         setFinalPlan(null);
         setAgents(AGENT_NAMES.map(name => ({ name, status: 'Idle' })));
-        
+
         // --- AUDIT PHASE ---
         setPhase('Audit');
         addLogEntry("Phase 1: Homework - Commencing project audit via the AI provider...", 'PHASE');
@@ -97,19 +97,19 @@ const Foundry: React.FC = () => {
         const auditResults: { name: AgentName, auditFindings: string }[] = [];
         for (const name of AGENT_NAMES) {
             updateAgentState(name, { status: 'Auditing', currentTask: 'Auditing project goal...' });
-            const specialty = 
-                name === 'Architect' ? 'system design and scalability' : 
-                name === 'Refactor' ? 'code quality and maintainability' : 
+            const specialty =
+                name === 'Architect' ? 'system design and scalability' :
+                name === 'Refactor' ? 'code quality and maintainability' :
                 name === 'Security' ? 'security and compliance' :
                 name === 'QA' ? 'quality assurance and testability' :
                 name === 'UX' ? 'user experience and interface design' :
                 name === 'DevOps' ? 'infrastructure as code (IaC), CI/CD, and deployment' :
                 'backend microservices, APIs, and databases';
             const prompt = `You are the ${name} agent. Your specialty is ${specialty}. Audit the following project goal from your unique perspective, using the provided project context. Identify key considerations and risks. Provide a one-paragraph summary.\n\nPROJECT GOAL: "${goal}"\n\nPROJECT CONTEXT:\n---\n${projectContext}\n---`;
-            
+
             try {
                 // Audit can use Flash for speed
-                const { resultText } = await generateRawText(prompt, '');
+                const { resultText } = await generateRawText(prompt, '', 'foundry.audit');
                 updateAgentState(name, { status: 'Done', auditFindings: resultText, currentTask: 'Audit complete.' });
                 addLogEntry(`${name} agent audit complete.`, 'SUCCESS');
                 auditResults.push({ name, auditFindings: resultText });
@@ -125,7 +125,7 @@ const Foundry: React.FC = () => {
         // --- DESIGN PHASE ---
         setPhase('Design');
         addLogEntry("Phase 2: Independent Design - Generating initial solutions...", 'PHASE');
-        
+
         const designResults: { name: AgentName, design: string, designScore: number }[] = [];
         for (const { name, auditFindings } of auditResults) {
             updateAgentState(name, { status: 'Designing', currentTask: 'Generating initial design proposal...' });
@@ -141,10 +141,10 @@ If you include a Mermaid diagram (using \`\`\`mermaid), you MUST ensure it is sy
 After the proposal, you MUST provide a self-assessed score (0-100) in the format: "SCORE: [number]".
 
 \n\nPROJECT GOAL: "${goal}"\n\nPROJECT CONTEXT:\n---\n${projectContext}\n---\n\nYOUR AUDIT: "${auditFindings}"`;
-            
+
             try {
                 // Design uses the new Pro model
-                const { resultText } = await generateRawText(prompt, '');
+                const { resultText } = await generateRawText(prompt, '', 'foundry.refine');
                 const { content, score } = parseScoreFromResult(resultText);
                 updateAgentState(name, { status: 'Done', design: content, designScore: score, currentTask: `Initial design ready. Score: ${score}` });
                 addLogEntry(`${name} agent initial design ready. [Score: ${score}]`, 'SUCCESS');
@@ -165,7 +165,7 @@ After the proposal, you MUST provide a self-assessed score (0-100) in the format
             }
             return baseAgent;
         }));
-        
+
         let currentAgents: FoundryAgent[] = AGENT_NAMES.map(name => {
             const agent = agents.find(a => a.name === name)!;
             const auditResult = auditResults.find(ar => ar.name === name);
@@ -183,7 +183,7 @@ After the proposal, you MUST provide a self-assessed score (0-100) in the format
 
         for (let round = 1; round <= NUM_ROUNDS; round++) {
             addLogEntry(`--- Refinement Round ${round} ---`, 'INFO');
-            
+
             // Step 1: Gather all peer feedback
             addLogEntry(`Round ${round}: Gathering peer reviews...`, 'INFO');
             const allFeedback: { designOwner: AgentName, reviewer: AgentName, feedback: string }[] = [];
@@ -195,9 +195,9 @@ After the proposal, you MUST provide a self-assessed score (0-100) in the format
 
                 updateAgentState(reviewer.name, { status: 'Reviewing', currentTask: `Reviewing ${designOwner.name}'s design...` });
                 const prompt = `You are the ${reviewer.name} agent. Review the design from the ${designOwner.name} agent, considering the original goal and project context. Provide one paragraph of constructive, actionable feedback. Do NOT provide a score.\n\nORIGINAL GOAL: "${goal}"\n\nPROJECT CONTEXT:\n---\n${projectContext}\n---\n\nDESIGN TO REVIEW (by ${designOwner.name}):\n---\n${designOwner.design}\n---`;
-                
+
                 try {
-                    const { resultText: feedback } = await generateRawText(prompt, '');
+                    const { resultText: feedback } = await generateRawText(prompt, '', 'foundry.feedback');
                     allFeedback.push({ designOwner: designOwner.name, reviewer: reviewer.name, feedback });
                     addLogEntry(`${reviewer.name} reviewed ${designOwner.name}'s design.`, 'SUCCESS');
                 } catch (e) {
@@ -211,21 +211,21 @@ After the proposal, you MUST provide a self-assessed score (0-100) in the format
 
             // Step 2: Refine designs based on feedback
             addLogEntry(`Round ${round}: Refining designs based on feedback...`, 'INFO');
-            
+
             const refinedAgents: FoundryAgent[] = [];
             for (const agent of currentAgents) {
                 const feedbackForAgent = allFeedback
                     .filter(f => f.designOwner === agent.name)
                     .map(f => `- Feedback from ${f.reviewer}: ${f.feedback}`)
                     .join('\n');
-                
+
                 if (!feedbackForAgent) {
                     refinedAgents.push({ ...agent }); // No feedback, no change
                     continue;
                 }
 
                 updateAgentState(agent.name, { status: 'Refining', currentTask: `Refining design based on peer feedback...` });
-                
+
                 const prompt = `You are the ${agent.name} agent. Your current design has been reviewed by your peers. Refine your design by incorporating their feedback to improve it, keeping the original goal and project context in mind. Produce a new, improved version of your design and provide a new self-assessed score (0-100) in the format: "SCORE: [number]".
 
 **Mermaid Diagram Rules:**
@@ -239,7 +239,7 @@ If you include a Mermaid diagram (using \`\`\`mermaid), you MUST ensure it is sy
 
                 try {
                     // Refinement uses the new Pro model
-                    const { resultText } = await generateRawText(prompt, '');
+                    const { resultText } = await generateRawText(prompt, '', 'foundry.refine');
                     const { content: newDesign, score: newScore } = parseScoreFromResult(resultText);
                     addLogEntry(`${agent.name} refined design. Score: ${agent.designScore?.toFixed(0)} -> ${newScore}`, 'DECISION');
                     refinedAgents.push({ ...agent, design: newDesign, designScore: newScore, currentTask: `Refinement complete. New Score: ${newScore}` });
@@ -258,7 +258,7 @@ If you include a Mermaid diagram (using \`\`\`mermaid), you MUST ensure it is sy
         // --- CONVERGENCE PHASE ---
         setPhase('Converged');
         addLogEntry("Phase 4: Convergence - Review complete. Selecting best design.", 'PHASE');
-        
+
         const winningAgent = currentAgents.reduce((best, current) => (current.designScore || 0) > (best.designScore || 0) ? current : best);
 
         const finalDesign = `# Final Converged Design (from ${winningAgent.name})\n\n**Final Score:** ${winningAgent.designScore?.toFixed(0)}/100\n\n---\n\n${winningAgent.design}`;
@@ -282,11 +282,11 @@ If you include a Mermaid diagram (using \`\`\`mermaid), you MUST ensure it is sy
                             rows={5}
                             disabled={isLoading}
                         />
-                        <RealTimeFeedback 
-                             isLoading={isRTLoading} 
-                             feedback={feedback} 
-                             onApply={applyFeedback} 
-                             onDiscard={discardFeedback} 
+                        <RealTimeFeedback
+                             isLoading={isRTLoading}
+                             feedback={feedback}
+                             onApply={applyFeedback}
+                             onDiscard={discardFeedback}
                         />
                         <button
                             onClick={startForgingProcess}

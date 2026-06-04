@@ -14,14 +14,19 @@
 export type Strategy = 'vote' | 'pick-best' | 'synthesize' | 'single';
 
 export const DEFAULT_BUTTON_STRATEGIES: Record<string, Strategy> = {
-  'shunt.amplify':        'synthesize',
-  'shunt.summarize':      'pick-best',
-  'shunt.translate':      'vote',
-  'shunt.factcheck':      'pick-best',
-  'weaver.outline':       'synthesize',
-  'foundry.refine':       'synthesize',
-  'oraculum.insights':    'synthesize',
-  'imageAnalysis.preset': 'single', // never bus — preset is LM Studio specific
+  'shunt.amplify':         'synthesize',
+  'shunt.summarize':       'pick-best',
+  'shunt.translate':       'vote',
+  'shunt.factcheck':       'pick-best',
+  'shunt.modular':         'synthesize', // executeModularPrompt (Shunt modular pipeline)
+  'shunt.synthesize-docs': 'synthesize', // synthesizeDocuments (multi-doc merge — natural fanout fit)
+  'shunt.grade':           'single', // never bus — gradeOutput parses a strict "Score: N" format
+  'weaver.outline':        'synthesize',
+  'foundry.audit':         'synthesize', // per-agent audit paragraphs
+  'foundry.feedback':      'synthesize', // peer-review feedback paragraphs
+  'foundry.refine':        'synthesize',
+  'oraculum.insights':     'synthesize',
+  'imageAnalysis.preset':  'single', // never bus — preset is LM Studio specific
 };
 
 /**

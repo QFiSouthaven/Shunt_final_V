@@ -665,26 +665,3 @@ main().catch((err) => {
   console.error(err && err.stack ? err.stack : err);
   process.exit(1);
 });
-  await writeIfReal(RAW_JSONL, raw + '\n');
-
-  // INDEX.md
-  const indexMd = buildIndexMd({ items, traces, errorItems });
-  await writeIfReal(INDEX_MD, indexMd);
-
-  // README.md
-  await writeIfReal(README_MD, buildReadmeMd());
-
-  log('');
-  log(`Done.`);
-  log(`  by-trace files: ${written}`);
-  log(`  by-peer files:  ${peerWritten}`);
-  log(`  INDEX.md bytes: ${indexMd.length}`);
-  log(`  RAW.jsonl lines: ${items.length}`);
-  log(`  output:         ${OUT_DIR}`);
-}
-
-main().catch((err) => {
-  console.error('organize-conversation-history failed:');
-  console.error(err && err.stack ? err.stack : err);
-  process.exit(1);
-});
