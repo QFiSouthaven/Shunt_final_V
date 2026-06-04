@@ -122,4 +122,29 @@ Pattern Z is the product's multi-AI mode: eligible actions fan out to several LL
 
 User and session IDs are minted in `App.tsx` (uuid v4, persisted to `localStorage`/`sessionStorage`) and seeded into `TelemetryProvider` as `GlobalTelemetryContext`. Telemetry init runs once from `index.tsx`.
 
-Telemetry is consolidated into `styles/services/telemetry
+Telemetry is consolidated into `styles/services/telemetry.service.ts` (class-based, used by `TelemetryContext`). The old module-scoped `telemetry.ts` has been removed. (Update 2026-05: consolidation completed; this paragraph previously documented the duplicate.)
+
+### Error handling & self-healing
+
+- `setupGlobalErrorHandlers()` wired at startup.
+- `index.html` inline script catches `window.onerror` and triggers a recovery overlay only on module-resolution failures (`Failed to resolve module specifier`, `Failed to fetch dynamically imported module`, `Importing a module script failed`, `blocked by a null value`). Recovery posts the error to the user's AI endpoint with `response_format: json_object` and asks for a fix plan.
+- `MiaContext` exposes `diagnoseLastError`, `generateFixAttempt`, `applyFix` for in-app diagnosis. **No mutex** — overlapping calls can clobber `activePlan`.
+
+## Conventions
+
+- **No relative climbs across top-level dirs.** Use the `@/...` alias.
+- **Lazy-load heavy tabs/features** following the MissionControl pattern.
+- **All AI calls go through `aiService.ts`.** Never instantiate a vendor SDK or call `fetch` to an AI endpoint directly. Never reintroduce `@google/genai` or any other vendor SDK.
+- **Pass `''` for model parameters at call sites.** `resolveModel` will use the user's configured model. Hardcoded vendor model names (e.g., `'gemini-2.5-flash'`, `'gpt-4'`) will be ignored or cause confusion.
+- **Provider order in `App.tsx` is load-bearing.** New contexts that depend on Settings/Telemetry/MCP/Mailbox/Mia must nest inside, not above them.
+- **Structured output uses Zod.** Define the schema in `types/schemas.ts`, pass to `generateJson` or use one of the typed wrappers.
+- **Multimodal:** when building `ContentPart[]`, use `{ text }` and `{ inlineData: { data, mimeType } }`. `aiService` collapses to plain string content when no image part is present (some text-only OpenAI-compatible servers reject array-form content).
+- **Do not respond with multiple answers or solutions that funnel down to the same answer.** If the options converge on the same conclusion, pick one and commit. Parallel choices are only useful when the paths and outcomes are genuinely distinct — otherwise they pad the response and signal indecision. Applies to strategy questions, design tradeoffs, and fire-word dispatch alike.
+
+## Reference docs (read-only)
+
+- `security.md` — historical analysis of Google AI Studio's "Build" agent. **Not** a security policy for this repo. Keep as architectural context for the prompt-engineering choices in `prompts.ts`.
+- `migrated_prompt_history/` — frozen artifacts from the AI Studio migration. Not loaded at runtime.
+- `prompts/system/*.md` — reference prompts; not loaded at runtime.
+- `BUILD_LOG.md` — append-only build journal. Read this for context on hub-bus and Worker decisions.
+- `HANDBOOK.md`, `STATE_SNAPSHOT.md` — operator onboarding and current-state snapshots.

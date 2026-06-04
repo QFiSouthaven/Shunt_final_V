@@ -60,4 +60,15 @@
       ],
       "icon": "tray-icon.png",
       "artifactName": "Aether-Shunt-Setup-${version}.${ext}"
-    
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Aether Shunt",
+      "uninstallDisplayName": "Aether Shunt ${version}"
+    }
+  }
+}

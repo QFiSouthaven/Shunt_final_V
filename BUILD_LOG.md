@@ -1176,4 +1176,70 @@ GH Actions run #1 failed in 3 seconds with **`The job was not started because yo
 **Lessons captured:**
 
 - Wrap-not-rebuild: reusing the splicer-desktop Electron pattern saved 70%+ of the wrapper code. Don't author new Electron mains when a proven one already exists in tree.
-- "St
+- "Store-bought" in a non-coder's vocabulary means TWO things, not one: (a) the install ceremony is one double-click, and (b) the program never asks them to make a config decision. The wrapper has to OWN backend selection (wizard does this) and OWN credential storage (safeStorage does this). The SPA's Settings tab is a developer surface; the wrapper hides it.
+- GH Actions is a single point of failure for cross-platform CI. If the operator's GitHub account is in any non-ideal billing state, the entire delivery pipeline stalls. PWA via Cloudflare Pages is a more resilient "store-bought" path because the only required external resource is the operator's already-paid Cloudflare account.
+
+**State snapshot refreshed.** `STATE_SNAPSHOT.md` rewritten to 2026-06-04 reflecting Phase C closure and the wrapper landing. `docs/SESSION_2026-06-04_HANDOFF.md` written for the next chat (operator switching from Opus 4.7 to Opus 4.8). `OPUS_BOOTSTRAP.md` at repo root for tight single-message bring-up.
+
+**Files modified outside the wrapper directory:** `STATE_SNAPSHOT.md` (full rewrite); `BUILD_LOG.md` (this entry); `CLAUDE.md` (added `aether-app/` to the top-level layout section).
+
+### Pattern Z Phase 7 — Pair daemon (2026-06-04)
+- `hub-bus-tools/claude-pair-daemon.mjs` ships (was planned 2026-05-13, never built).
+- Polls @architect + @executor inboxes, runs `claude -p` per turn, writes replies back to the bus. Stops on MAX_TURNS, error (alerts @zack), or stop:true.
+- Deviations from plan §8.2 (API drift): `releaseEnvelope` imports from `claim.mjs`; inbox entries are flat envelopes with `__path`; replies use `kind:'response'`; `shell:true` on win32 (claude is a .cmd shim); tick overlap guard added.
+- NOT an orchestrator child (per §8.3) — operator-launched.
+- Verification: `node --check` clean.
+
+### Pattern Z §7.3 — remaining call-site wiring (2026-06-04)
+- `executeModularPrompt` → `shunt.modular` (synthesize), `synthesizeDocuments` → `shunt.synthesize-docs` (synthesize), `generateOraculumInsights` → `oraculum.insights` via `maybeDispatch`.
+- `generateRawText` gains optional third param `intent`; dispatches only for string prompts (multimodal ContentPart[] always single-LLM). Foundry passes `foundry.audit` / `foundry.feedback` / `foundry.refine`; useJobManager passes `weaver.outline`.
+- `gradeOutput` deliberately stays single-LLM — strict "Score: N" parse contract; map pins `shunt.grade: 'single'`.
+- New `busTokenUsage()` helper; performShunt now uses it too.
+- Strategy map gains: shunt.modular, shunt.synthesize-docs, shunt.grade(single), foundry.audit, foundry.feedback.
+
+### Pattern Z Phase 8 — docs + rails (2026-06-04)
+- CLAUDE.md gains the "Pattern Z (multi-LLM collaborative output)" architecture section.
+- `aiService.dispatchToBus` gains the DO-NOT-bypass inline rail (§9.4). Aggregator already had its loopback rail.
+
+### Aggregator: strip <think> blocks from candidate replies (2026-06-04)
+- Live smoke exposed it: qwen3 on @lmstudio-1 returned a raw `<think>` reasoning dump; pick-best (longest-wins) selected it over two correct "pong" replies.
+- `stripThinkBlocks()` in aggregator.mjs now strips closed think blocks (and truncates at an unclosed one) at both reply-collection sites. Falls back to the original text if stripping would leave nothing.
+- Verified live: restart aggregator → re-dispatch → joint_output "pong"; partial-result path (2/3 peers) also confirmed working.
+
+### W-1 closed: D1 migration 0004 applied remotely (2026-06-04)
+- `server_seq INTEGER` column + `idx_transcripts_room_server_seq` applied to `hub_transcripts` (a87829d1, Runing Runway account) via the Cloudflare connector — no terminal involved. PRAGMA confirms cid 13.
+- NOTE: the comment in `migrations/0004_server_seq.sql` points at database d0466d8d — that's the abandoned twin on the other Cloudflare account. wrangler.toml's a87829d1 is the live binding; trust wrangler.toml.
+- W-2 (worker redeploy) still open — the connector has no deploy capability; the deployed Worker ignores the new column until redeployed (harmless).
+
+### Repo hygiene: tsc fully clean for the first time (2026-06-04)
+- Fixed `tools/organize-conversation-history.mjs` — lines 668-690 were a duplicated paste of the function tail (the TS1128 documented since 2026-05-15). File now ends at the real `main().catch`.
+- The TS1128 was a SYNTAX error, which suppressed ALL semantic type-checking. Fixing it unmasked ~80 pre-existing errors, resolved as:
+  - tsconfig.json gains an `exclude` for the sub-projects (aether-app, aether-shunt-hub, cockpit, hub-bus-panel-desktop, hub-cloudflare) — each has its own tsconfig; the root sweep was checking them with the wrong paths/aliases.
+  - Deleted orphans (zero importers, git-recoverable): `styles/services/geminiService.ts`, `styles/services/miaService.ts` (consolidated into aiService long ago), `styles/services/context/AutonomousContext.tsx`, `hooks/components/AdaptiveButton.tsx`, `hooks/components/AdaptivePanel.tsx`, `hooks/components/developers/` (imports `reactflow` which isn't even in package.json; Chronicle uses its own DiffViewer).
+- `zip/` + `zip.zip` deleted per operator verdict (C-1 closed).
+- `npx tsc --noEmit` exit 0. `node --check` clean on all touched bus files.
+
+### Live smoke 2026-06-04 (Aether.bat launch, operator machine)
+| Check | Result |
+|---|---|
+| SPA :3000 | ✅ renders, console clean |
+| Orchestrator :7779 | ✅ children running, restarts 0 |
+| Aggregator :7780 | ✅ healthz + participants OK |
+| Panel-server :7777 | ✅ presence: @claude @gemini @lmstudio-1 online |
+| LM Studio :1234 | ✅ models listed |
+| Pattern Z dispatch | ✅ 3/3 peers replied; after think-strip fix joint output correct; 2/3 partial path verified |
+| NEXUS :8000 | ❌ down (not started by Aether.bat — Journal/Goals/A2A/Evolution tabs will show offline) |
+| aether-shunt-hub | not running, not needed — SPA BusControl + Hub tab cover its role (ASH-1 evidence) |
+
+### Root `start.bat` — full-stack one-click launcher (2026-06-04)
+- Supersedes `Aether.bat` (kept) by adding the two pieces it didn't start: **LM Studio** (`lms server start` if the CLI exists, else opens the app with a notice) and **NEXUS-PRIME** (launches `C:\Users\Falki\websiteAgents\websiteAgents\start.bat` — path recovered from the git-tracked `start/start-nexus-prime.bat`, which is missing from the working tree).
+- **Idempotent:** every service is port-checked first (`netstat`+`findstr` on :1234/:8000/:7779/:3000) and skipped if already listening — safe to double-click any time as a "make everything green" button.
+- Verified live: with bus+SPA+LM Studio already up, it skipped those, started NEXUS-PRIME, and all six services then probed 200 (3000/7779/7780/7777/1234/8000). First time the full stack including NEXUS has been green this session.
+- Observed while testing: the Hub tab's splicer shows "Health check failed: Failed to fetch" against `hub-relay.halkive.workers.dev` — the deployed Worker needs investigation (possibly just the pending W-2 redeploy, possibly CORS/availability). Not addressed in this entry.
+
+### Operator verdict: Cloudflare Worker path dropped (2026-06-04)
+- zack's call, verbatim: "fuck the workers." Same standing weight as "forget the .exe" — do not re-pitch unsolicited.
+- W-2 (worker redeploy) and W-3 (post-deploy verification) — **closed, won't-do**. The splicer health-check failure against `hub-relay.halkive.workers.dev` is moot.
+- The migration 0004 already applied to remote D1 is harmless either way (nullable column, nothing reads it).
+- Everything that matters runs locally: SPA + bus + aggregator + bridges + NEXUS, all loopback. Pattern Z is fully functional without the Worker.
+- Not done (awaiting explicit ask): deleting `hub-cloudflare/` from the tree, removing the Hub tab from the dock, or cancelling the $5/mo Workers Paid plan. The dock's Hub tab will keep showing a failed health check until one of those happens.
