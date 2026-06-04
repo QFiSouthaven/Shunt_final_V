@@ -1,0 +1,63 @@
+{
+  "name": "aether-shunt-app",
+  "version": "0.1.0",
+  "description": "Aether Shunt — multi-AI collaborative text-transform desktop app.",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "postinstall": "node gen-icon.cjs",
+    "icon": "node gen-icon.cjs",
+    "prestart": "node -e \"require('node:fs').existsSync('tray-icon.png')||require('node:child_process').execSync('node gen-icon.cjs',{stdio:'inherit'})\"",
+    "start": "electron .",
+    "dev": "electron .",
+    "prebuild": "node -e \"require('node:fs').existsSync('tray-icon.png')||require('node:child_process').execSync('node gen-icon.cjs',{stdio:'inherit'})\"",
+    "predist": "node -e \"const fs=require('node:fs'),p=require('node:path');const dist=p.resolve(__dirname,'..','dist');if(!fs.existsSync(p.join(dist,'index.html'))){console.error('SPA dist/ missing. Run from repo root: npm install && npx vite build --base=./');process.exit(1)}\"",
+    "build": "electron-builder --win nsis",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.halkive.aether-shunt",
+    "productName": "Aether Shunt",
+    "copyright": "Copyright (c) 2026 halkive",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "first-run.html",
+      "tray-icon.png",
+      "gen-icon.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "spa",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../hub-bus-tools",
+        "to": "hub-bus-tools",
+        "filter": ["**/*.mjs", "**/*.json", "!__check_*.mjs", "!__test-*.mjs"]
+      },
+      {
+        "from": "../hub-bus",
+        "to": "hub-bus",
+        "filter": ["PROTOCOL.md", "README.md", "participants.json"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "tray-icon.png",
+      "artifactName": "Aether-Shunt-Setup-${version}.${ext}"
+    

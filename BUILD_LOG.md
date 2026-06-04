@@ -1131,3 +1131,7 @@ Operator asked for "a start script .exe that opens both." Shipped as a `.bat` at
 - `start/start-everything.bat` already existed but launched NEXUS-PRIME + bus + chatroom panel (no SPA). `Aether.bat` is the SPA+bus pair specifically.
 
 **Why not a true `.exe`:** generating a real Windows binary requires external tooling (`bat2exe`, `iexpress`, `ps2exe`, or Node `pkg`) that isn't in this repo's toolchain. The `.bat` behaves identically for the double-click-and-go workflow. Note in the file header points operators to `bat-to-exe.com` if they want a true `.exe` for taskbar pinning.
+
+### Dev-server restart (2026-05-18)
+
+Vite dev server was down; operator asked for a background restart. Ports :3000 and :3001 both free at check (PID 4540 zombie from earlier sessions had already died — likely killed via admin shell or reboot). Started `npm run dev` as a background job; Vite came up on canonical **http://127.0.0.1:3000/** in 457 ms; `curl` returned HTTP 200 (1168 bytes, TTFB 40 ms). No source touched.

@@ -1,0 +1,96 @@
+name: Build Windows installer
+
+# Builds Aether-Shunt-Setup-<version>.exe in the cloud on a Windows runner,
+# attaches it to a GitHub Release. The operator downloads the .exe from the
+# Releases tab and double-clicks. No terminal commands on their side.
+#
+# Triggers:
+#   - Manual: Actions tab → "Build Windows installer" → Run workflow
+#   - Push to main that touches the wrapper or SPA
+#   - Pushing a v*.*.* tag creates a Release with the .exe attached
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'aether-app/**'
+      - 'hooks/**'
+      - 'styles/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'lib/**'
+      - 'public/**'
+      - 'App.tsx'
+      - 'index.tsx'
+      - 'index.html'
+      - 'vite.config.ts'
+      - 'package.json'
+      - '.github/workflows/build-installer.yml'
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            **/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install SPA deps
+        run: npm install --no-audit --no-fund
+
+      - name: Build SPA (vite → dist/) with relative base
+        # --base=./ produces relative asset URLs so Electron can load dist/index.html
+        # via file:// without 404ing on /assets/*. The dev server doesn't need this
+        # (it serves from /), so we pass the flag only at build time.
+        run: npx vite build --base=./
+
+      - name: Install Electron deps
+        working-directory: aether-app
+        run: npm install --no-audit --no-fund
+
+      - name: Build Windows installer
+        working-directory: aether-app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist
+
+      - name: Show artifact
+        run: |
+          Get-ChildItem aether-app/dist/*.exe | Format-Table FullName, Length
+        shell: pwsh
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aether-Shunt-Setup
+          path: aether-app/dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach installer to Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: aether-app/dist/*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
